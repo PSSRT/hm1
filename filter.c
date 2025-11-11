@@ -25,10 +25,25 @@
 #include <fcntl.h>
 #include <math.h>
 
+
 #define SIG_SAMPLE SIGRTMIN
 #define SIG_HZ 1
 #define OUTFILE "signal.txt"
 #define F_SAMPLE 50
+
+#define TICK_PERIOD 5000
+#define NSEC_PER_SEC 1000000000ULL
+
+/* periodic thread */
+struct periodic_thread {
+	int index;
+	struct timespec r;
+	int period;
+	int wcet;
+	int priority;
+};
+
+
 
 #define USAGE_STR				\
 	"Usage: %s [-s] [-n] [-f]\n"		\
@@ -37,6 +52,43 @@
 	"\t -f: plot filtered signal\n"		\
 	""
 	
+
+/***************************** Functions ************************************/
+
+static inline void timespec_add_us(struct timespec *t, uint64_t d)
+{
+    d *= 1000;
+    t->tv_nsec += d;
+    t->tv_sec += t->tv_nsec / NSEC_PER_SEC;
+    t->tv_nsec %= NSEC_PER_SEC;
+}
+
+void wait_next_activation(struct periodic_thread * thd)
+{
+    clock_nanosleep(CLOCK_REALTIME, TIMER_ABSTIME, &(thd->r), NULL);
+    timespec_add_us(&(thd->r), thd->period);
+}
+
+void start_periodic_timer(struct periodic_thread * thd, uint64_t offs)
+{
+    clock_gettime(CLOCK_REALTIME, &(thd->r));
+    timespec_add_us(&(thd->r), offs);
+}
+
+/***************************** THREADS ************************************/
+void* rt_gen(void* parameter){
+	struct periodic_thread *th = (struct periodic_thread *) parameter;
+	start_periodic_timer(th,th->period);
+	
+	while(1){
+		wait_next_activation(th);	
+		
+	
+	}
+
+}
+
+
 // 2nd-order Butterw. filter, cutoff at 2Hz @ fc = 50Hz
 #define BUTTERFILT_ORD 2
 double b [3] = {0.0134,    0.0267,    0.0134};
@@ -56,6 +108,15 @@ int flag_filtered = 0;
 
 int main(int argc, char ** argv)
 {
+	//creazione threads
+	struct periodic_thread th_gen;
+	struct periodic_thread th_filer;
+	
+	pthread_t thread_gen;
+	pthread_t thread_filter;
+
+
+	///---------------------------------///
 
 	struct sigaction sa;
 	sigset_t mask, wait_mask;
