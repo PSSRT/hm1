@@ -1,19 +1,4 @@
-/************************************************/
-/*                                              */
-/*  Real-time Task Signal Filtering Demo        */
-/*                                              */
-/*  This demo combines RT POSIX.4 signals and   */
-/*  timers, and generates a periodic signal     */
-/*  that is filtered using a digital filter     */
-/*  with given coefficients.                    */
-/*                                              */
-/*  Author: Renato Mancuso (BU)                 */
-/*  Class: CS454/654 Embedded Syst. Devel.      */
-/*  Date: April 2020                            */
-/*                                              */
-/************************************************/
-
-
+#include <pthread.h>  //inserimento della libreria pthread per la creazione di thread periodici
 #include <stdio.h>
 #include <stdlib.h>
 #include <signal.h>
@@ -24,11 +9,13 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <math.h>
+#include "rt-lib.h"
 
 #define SIG_SAMPLE SIGRTMIN
-#define SIG_HZ 1
+#define SIG_HZ 1.0
 #define OUTFILE "signal.txt"
-#define F_SAMPLE 50
+#define T_SAMPLE 20000
+
 
 #define USAGE_STR				\
 	"Usage: %s [-s] [-n] [-f]\n"		\
@@ -44,133 +31,140 @@ double a [3] = {1.0000,   -1.6475,    0.7009};
 
 static int first_mean=0;
 
-void handle_my_signal(int signo, siginfo_t * info, void * extra);
 double get_butter(double cur, double * a, double * b);
 double get_mean_filter(double cur);
-void parse_cmdline(int argc, char ** argv);
 
 /* Global flags reflecting the command line parameters */
 int flag_signal = 0;
 int flag_noise = 0;
 int flag_filtered = 0;
 
-int main(int argc, char ** argv)
+//dichiarazione variabili per le risorse condivise
+double sig_noise;
+double sig_val;
+double sig_filt;
+
+pthread_mutex_t mutex_noise;
+pthread_mutex_t mutex_val;
+pthread_mutex_t mutex_filter;
+
+
+void* generation (void * parameter)
 {
+    //si usa la libreria pthread.h per creare generare il thread
+    periodic_thread *gen = (periodic_thread *) parameter;//non necessario 'struct' perche nel file rt-lib.h è definita come typedef
+    start_periodic_timer(gen, gen->period);
+    // Generate signal
+    const double Ts = T_SAMPLE/1e6;         //sample time in secondi
+    double t = 0.0;
 
-	struct sigaction sa;
-	sigset_t mask, wait_mask;
-	struct sigevent ev;
-	struct itimerspec it;
-	timer_t timer;
-	int outfile;
-	FILE * outfd;
-	
-	int f_sample = F_SAMPLE; /* Frequency of sampling in Hz */
-	double t_sample = (1.0/f_sample) * 1000 * 1000 * 1000; /* Sampling period in ns */
+    while(1){
+        wait_next_activation(gen);
+        
+        pthread_mutex_lock(&mutex_val);//wait sulla risorsa sig_val
+        sig_val = sin(2*M_PI*SIG_HZ*t);
 
-	// Command line input parsing
-	parse_cmdline(argc, argv);
-	
-	// File Opening
-	outfile = open(OUTFILE, O_WRONLY | O_CREAT | O_TRUNC, 0666);
-	outfd = fdopen(outfile, "w");
-	
-	if (outfile < 0 || !outfd) {
-		perror("Unable to open/create output file. Exiting.");
-		return EXIT_FAILURE;
-	}
+        // Add noise to signal
+        pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
 
-	sa.sa_flags = SA_SIGINFO;
-	
-	/* Not using sa.sa_handler */
-	sa.sa_sigaction = handle_my_signal;
+        sig_noise = sig_val + 0.5*cos(2*M_PI*10*t);
+        sig_noise += 0.9*cos(2*M_PI*4*t);
+        sig_noise += 0.9*cos(2*M_PI*12*t);
+        sig_noise += 0.8*cos(2*M_PI*15*t);
+        sig_noise += 0.7*cos(2*M_PI*18*t);
 
-	sigemptyset(&mask);
-	sigemptyset(&wait_mask);
-	sigemptyset(&sa.sa_mask);
+        pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
+        pthread_mutex_unlock(&mutex_val);//signal sulla risorsa sig_val
 
-	sigaddset(&sa.sa_mask, SIG_SAMPLE);
-	sigaddset(&mask, SIG_SAMPLE);
-	
-	sigaddset(&wait_mask, SIGRTMAX);
-
-	sigprocmask(SIG_BLOCK, &mask, NULL);
-
-	sigaction(SIG_SAMPLE, &sa, NULL);
-	
-	/* Timer creation */
-	memset(&ev, 0, sizeof(ev));
-	ev.sigev_notify = SIGEV_SIGNAL;
-	ev.sigev_signo = SIG_SAMPLE;
-	ev.sigev_value.sival_ptr = (void *)outfd;
-	
-	timer_create(CLOCK_REALTIME, &ev, &timer);
-
-	memset(&it, 0, sizeof(it));
-	it.it_value.tv_sec = 1;
-	it.it_value.tv_nsec = 0;
-	it.it_interval.tv_sec = 0;
-	it.it_interval.tv_nsec = t_sample;
-	
-	timer_settime(timer, 0, &it, NULL);
-
-	while (1) {
-	    sigsuspend(&wait_mask);	    
-	}
-
-	return EXIT_SUCCESS;
+        t += Ts; /* Sampling period in s */
+        
+    }	
 }
 
-void handle_my_signal(int signo, siginfo_t * info, void * extra)
+
+
+void* filtering (void * parameter)
 {
-	static double glob_time = 0;
-	FILE * outfd = (FILE *)info->si_value.sival_ptr;
-	
-	(void)extra;
-	(void)info;
-	(void)signo;
-	
-	// Generate signal
-	double sig_val = sin(2*M_PI*SIG_HZ*glob_time);
+    periodic_thread *filter= (periodic_thread *) parameter;
+    start_periodic_timer(filter, filter->period);
 
-	// Add noise to signal
-	double sig_noise = sig_val + 0.5*cos(2*M_PI*10*glob_time);
-	sig_noise += 0.9*cos(2*M_PI*4*glob_time);
-	sig_noise += 0.9*cos(2*M_PI*12*glob_time);
-	sig_noise += 0.8*cos(2*M_PI*15*glob_time);
-	sig_noise += 0.7*cos(2*M_PI*18*glob_time);
-
-	// Apply Filter to signal
-	//double sig_filt = get_butter(sig_noise, a, b);
-	double sig_filt = get_mean_filter(sig_noise);
-
-	// Write values in txt file
-	fprintf(outfd, "%lf,", glob_time);
-	
-	if (flag_signal)
-		fprintf(outfd, "%lf,", sig_val);
-	else
-		fprintf(outfd, ",");
-	
-	if (flag_noise)
-		fprintf(outfd, "%lf,", sig_noise);
-	else
-		fprintf(outfd, ",");
-
-	if (flag_filtered)
-		fprintf(outfd, "%lf,", sig_filt);
-	else
-		fprintf(outfd, ",");
-
-	fprintf(outfd, "\n");
-	fflush(outfd);
-	
-	// Debug
-	printf("glob_time: %lf, sig: %lf, sig_noise: %lf, sig_filter: %lf\n", glob_time, sig_val, sig_noise, sig_filt);
-
-	glob_time += (1.0/F_SAMPLE); /* Sampling period in s */
-	
+    // Filtering signal
+    while(1){
+        wait_next_activation(filter);
+        
+        pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
+        pthread_mutex_lock(&mutex_filter);//wait sulla risorsa sig_filt
+        //sig_filt = get_butter(sig_noise, a, b);
+	    sig_filt = get_mean_filter(sig_noise);
+        pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
+        pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
+    }	
 }
+
+
+int main()
+{
+    //implemantazione dei mutex, si usa come protocollo il Priority ceiling
+    int ceiling = 80; // si setta il ceiling al massimo delle priorità tra tutti i thread che possono prendere quel mutex
+    pthread_mutexattr_t mymutexattr; //attributo generale per una variabile mutex 
+    pthread_mutexattr_init(&mymutexattr); //inizializazzione della variabile
+    pthread_mutexattr_setprotocol(&mymutexattr, PTHREAD_PRIO_PROTECT);
+    pthread_mutexattr_setprioceiling(&mymutexattr, ceiling);
+
+    //inizializzazione del mutex per la variabile sig_noise
+    pthread_mutex_init(&mutex_noise, &mymutexattr);
+    //inizializzazione del mutex per la variabile sig_val
+    pthread_mutex_init(&mutex_val, &mymutexattr);
+    //inizializzazione del mutex per la variabile sig_filter
+    pthread_mutex_init(&mutex_filter, &mymutexattr);
+
+
+    // distruzione attributo dei mutex
+    pthread_mutexattr_destroy(&mymutexattr);
+
+    //implementazione dei thread
+    pthread_t th_gen;       //thd1 = th_gen
+    pthread_t th_filter;
+
+    periodic_thread TH_gen;
+    periodic_thread TH_filter;
+
+    //IMPLEMENTAZIONE THREAD
+    pthread_attr_t attr;
+    struct sched_param par;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setschedpolicy(&attr,SCHED_FIFO);
+    pthread_attr_setinheritsched(&attr,PTHREAD_EXPLICIT_SCHED);
+
+    //THREAD GENERAZIONE SEGNALE
+    TH_gen.index = 1;
+    TH_gen.period = T_SAMPLE;
+    TH_gen.priority = 80;
+    par.sched_priority= TH_gen.priority;
+    pthread_attr_setschedparam(&attr,&par);
+    pthread_create(&th_gen, &attr, generation, &TH_gen);
+
+
+    //THREAD FILTRAGGIO SEGNALE
+    TH_filter.index = 2;
+    TH_filter.period = T_SAMPLE;
+    TH_filter.priority = 70;
+    par.sched_priority= TH_filter.priority;
+    pthread_attr_setschedparam(&attr,&par);
+    pthread_create(&th_filter, &attr, filtering, &TH_filter);
+    
+    //distruzione attributo dei thread 
+    pthread_attr_destroy(&attr);
+
+    while(1) {
+        if(getchar()=='q') break;
+    }
+
+    return 0;
+}
+
+
 
 double get_butter(double cur, double * a, double * b)
 {
@@ -222,29 +216,3 @@ double get_mean_filter(double cur)
 	return retval;
 }
 
-void parse_cmdline(int argc, char ** argv)
-{
-	int opt;
-	
-	while ((opt = getopt(argc, argv, "snf")) != -1) {
-		switch (opt) {
-		case 's':
-			flag_signal = 1;
-			break;
-		case 'n':
-			flag_noise = 1;
-			break;
-		case 'f':
-			flag_filtered = 1;
-			break;
-		default: /* '?' */
-			fprintf(stderr, USAGE_STR, argv[0]);
-			exit(EXIT_FAILURE);
-		}
-	}
-	
-	if ((flag_signal | flag_noise | flag_filtered) == 0)
-	{
-		flag_signal = flag_noise = flag_filtered = 1;
-	}
-}
