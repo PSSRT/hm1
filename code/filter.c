@@ -92,8 +92,10 @@ void* filtering (void * parameter)
         
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
         pthread_mutex_lock(&mutex_filter);//wait sulla risorsa sig_filt
+        
         //sig_filt = get_butter(sig_noise, a, b);
 	    sig_filt = get_mean_filter(sig_noise);
+
         pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
     }	
