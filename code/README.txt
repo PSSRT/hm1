@@ -1,5 +1,5 @@
 To compile the demo:
-gcc -o filter filter.c -lm -lrt -W -Wall
+gcc -o filter filter.c rt-lib.c -lm -lrt -lpthread -Wall
 
 To test the demo: 
 
