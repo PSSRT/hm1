@@ -56,10 +56,9 @@ void* generation (void * parameter)
     // Generate signal
     const double Ts = T_SAMPLE/1e6;         //sample time in secondi
     double t = 0.0;
-    //printf("Thread 1 in corso");
+    
 
     while(1){
-        //printf("thread 1 iniziato");
         wait_next_activation(gen);
         pthread_mutex_lock(&mutex_val);//wait sulla risorsa sig_val
         sig_val = sin(2*M_PI*SIG_HZ*t);
@@ -77,8 +76,8 @@ void* generation (void * parameter)
         pthread_mutex_unlock(&mutex_val);//signal sulla risorsa sig_val
 
         t += Ts; /* Sampling period in s */
-        sleep(1);
-        printf("Thread 1 in corso, il segnale rumoroso è: %lf\n", sig_noise);
+        usleep(1);
+        printf("Thread 1 in corso\n");
     }	
 }
 
@@ -90,14 +89,15 @@ void* filtering (void * parameter)
     // Filtering signal
     while(1){
         wait_next_activation(filter);
-        
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
         pthread_mutex_lock(&mutex_filter);//wait sulla risorsa sig_filt
         //sig_filt = get_butter(sig_noise, a, b);
 	    sig_filt = get_mean_filter(sig_noise);
         pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
-    }	
+        sleep(1.5);
+        printf("Thread 2 in corso\n");
+    }
 }
 
 
@@ -125,8 +125,8 @@ int main()
     pthread_t th_gen;       //thd1 = th_gen
     pthread_t th_filter;
 
-    periodic_thread TH_gen;
-    periodic_thread TH_filter;
+    periodic_thread * TH_gen = malloc(sizeof(periodic_thread));
+    periodic_thread * TH_filter = malloc(sizeof(periodic_thread));
 
     //IMPLEMENTAZIONE THREAD
     pthread_attr_t attr;
@@ -137,31 +137,25 @@ int main()
     pthread_attr_setinheritsched(&attr,PTHREAD_EXPLICIT_SCHED);
 
     //THREAD GENERAZIONE SEGNALE
-    TH_gen.index = 1;
-    TH_gen.period = T_SAMPLE;
-    TH_gen.priority = 80;
-    par.sched_priority= TH_gen.priority;
+    TH_gen->index = 1;
+    TH_gen->period = T_SAMPLE;
+    TH_gen->priority = 80;
+    par.sched_priority= TH_gen->priority;
     pthread_attr_setschedparam(&attr,&par);
-    pthread_create(&th_gen, &attr, generation, &TH_gen);
+    pthread_create(&th_gen, &attr, generation, TH_gen);
 
 
     //THREAD FILTRAGGIO SEGNALE
-    TH_filter.index = 2;
-    TH_filter.period = T_SAMPLE;
-    TH_filter.priority = 80;
-    par.sched_priority= TH_filter.priority;
+    TH_filter->index = 2;
+    TH_filter->period = T_SAMPLE;
+    TH_filter->priority = 80;
+    par.sched_priority= TH_filter->priority;
     pthread_attr_setschedparam(&attr,&par);
-    pthread_create(&th_filter, &attr, filtering, &TH_filter);
+    pthread_create(&th_filter, &attr, filtering, TH_filter);
     
     //distruzione attributo dei thread 
     pthread_attr_destroy(&attr);
-
-    while(1) {
-        if(getchar()=='q'){
-            printf("Processo terminato con successo!\n");
-            break;}
-    }
-
+    pthread_exit(NULL);
     return 0;
 }
 
@@ -205,13 +199,6 @@ double get_mean_filter(double cur)
 	vec_mean[0] = cur;
 
 	//printf("in[0]: %f, in[1]: %f\n", in[0], in[1]); //DEBUG
-
-	// Compute filtered value1 I root        7525       2 TS   19 -     0 -      09:54 ?        00:00:00 [kworker/2:2-kacpi_notify]
-5 S giacomo     7526    4272 TS   19 - 611614 poll_s 09:54 ?       00:00:00 /snap/firefox/7177/usr/lib/firefox/firefo
-1 I root        7557       2 TS   19 -     0 -      09:54 ?        00:00:00 [kworker/u32:2-events_unbound]
-4 S root        7629    6366 TS   19 -  3593 -      09:55 pts/1    00:00:00 sudo ./filter
-1 S root        7630    7629 TS   19 -  3593 -      09:55 pts/0    00:00:00 sudo ./filter
-4 S root        7631    7630 TS   19 - 3779
 	if (first_mean == 0){
 		retval = vec_mean[0];
 		first_mean ++;
