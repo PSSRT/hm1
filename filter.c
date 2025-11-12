@@ -10,12 +10,13 @@
 #include <fcntl.h>
 #include <math.h>
 #include "rt-lib.h"
+#include <errno.h> //per il controllo degli errorri
+#include <mqueue.h> //inclusione della libreria per la creazione e gestione di code per la comunicazione tar filter.c e store.c
 
 #define SIG_SAMPLE SIGRTMIN
 #define SIG_HZ 1.0
 #define OUTFILE "signal.txt"
-#define T_SAMPLE 20000
-
+#define T_SAMPLE 20000 // 50 Hz
 
 #define USAGE_STR				\
 	"Usage: %s [-s] [-n] [-f]\n"		\
@@ -29,55 +30,78 @@
 double b [3] = {0.0134,    0.0267,    0.0134};
 double a [3] = {1.0000,   -1.6475,    0.7009};
 
-static int first_mean=0;
 
-double get_butter(double cur, double * a, double * b);
-double get_mean_filter(double cur);
+//Variabili per la coda
+#define MQ_NAME "/print_q" //nome della coda
+#define MAX_MSG 10 //massimo numero di messaggi 
 
-/* Global flags reflecting the command line parameters */
-int flag_signal = 0;
-int flag_noise = 0;
-int flag_filtered = 0;
+typedef struct{
+    struct timespec ts;
+    double t;
+    double val;
+    double noise;
+    double filt;
+}sample_msg_t;
 
-//dichiarazione variabili per le risorse condivise
+mqd_t my_queue;
+
+
+//variabili per le risorse condivise
 double sig_noise;
 double sig_val;
 double sig_filt;
+double t = 0.0; 
 
 pthread_mutex_t mutex_noise;
 pthread_mutex_t mutex_val;
 pthread_mutex_t mutex_filter;
+pthread_mutex_t mutex_time;
 
+//PROTOTIPI DI FUNZIONI
+double get_butter(double cur, double * a, double * b);
+double get_mean_filter(double cur);
+
+static int first_mean=0;
 
 void* generation (void * parameter)
 {
     //si usa la libreria pthread.h per creare generare il thread
     periodic_thread *gen = (periodic_thread *) parameter;//non necessario 'struct' perche nel file rt-lib.h è definita come typedef
     start_periodic_timer(gen, gen->period);
-    // Generate signal
+    //Generate signal
     const double Ts = T_SAMPLE/1e6;         //sample time in secondi
-    double t = 0.0;
 
     while(1){
         wait_next_activation(gen);
         
+        double t_local;
+        pthread_mutex_lock(&mutex_time);
+        t_local = t; /* Sampling period in s */
+        pthread_mutex_unlock(&mutex_time);
+
+        double sig_val_local = sin(2*M_PI*SIG_HZ*t_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+
         pthread_mutex_lock(&mutex_val);//wait sulla risorsa sig_val
-        sig_val = sin(2*M_PI*SIG_HZ*t);
-
-        // Add noise to signal
-        pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
-
-        sig_noise = sig_val + 0.5*cos(2*M_PI*10*t);
-        sig_noise += 0.9*cos(2*M_PI*4*t);
-        sig_noise += 0.9*cos(2*M_PI*12*t);
-        sig_noise += 0.8*cos(2*M_PI*15*t);
-        sig_noise += 0.7*cos(2*M_PI*18*t);
-
-        pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
+        sig_val = sig_val_local; //assegno alla risorsa condivisa ail valore della variabile locale
         pthread_mutex_unlock(&mutex_val);//signal sulla risorsa sig_val
 
-        t += Ts; /* Sampling period in s */
+        // Add noise to signal
+        double sig_noise_local;//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+
+        sig_noise_local = sig_val_local + 0.5*cos(2*M_PI*10*t_local);
+        sig_noise_local += 0.9*cos(2*M_PI*4*t_local);
+        sig_noise_local += 0.9*cos(2*M_PI*12*t_local);
+        sig_noise_local += 0.8*cos(2*M_PI*15*t_local);
+        sig_noise_local += 0.7*cos(2*M_PI*18*t_local);
+
+        pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
+        sig_noise = sig_noise_local;//assegno alla risorsa condivisa ail valore della variabile locale
+        pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
         
+        pthread_mutex_lock(&mutex_time);
+        t += Ts; /* Sampling period in s */
+        pthread_mutex_unlock(&mutex_time);
+
     }	
 }
 
@@ -92,19 +116,50 @@ void* filtering (void * parameter)
     while(1){
         wait_next_activation(filter);
         
+        double sig_noise_local;//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
-        pthread_mutex_lock(&mutex_filter);//wait sulla risorsa sig_filt
-        //sig_filt = get_butter(sig_noise, a, b);
-	    sig_filt = get_mean_filter(sig_noise);
-        pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
+        sig_noise_local = sig_noise;//assegno alla risorsa condivisa ail valore della variabile locale
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
+
+        double sig_filt_local = get_mean_filter(sig_noise_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        pthread_mutex_lock(&mutex_filter);//wait sulla risorsa sig_filt
+        //sig_filt = get_butter(sig_filt_local, a, b);
+	    sig_filt = sig_filt_local;//assegno alla risorsa condivisa ail valore della variabile locale
+        pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
+
+        //creazione del messaggio da mandare nella coda 
+        sample_msg_t msg;
+        clock_gettime(CLOCK_REALTIME, &msg.ts);  // o CLOCK_MONOTONIC, come preferisci
+ 
+        pthread_mutex_lock(&mutex_time);
+        msg.t = t;
+        pthread_mutex_unlock(&mutex_time);
+    
+        pthread_mutex_lock(&mutex_val);
+        msg.val = sig_val;
+        pthread_mutex_lock(&mutex_noise);
+        msg.noise = sig_noise;
+        pthread_mutex_lock(&mutex_filter);
+        msg.filt = sig_filt;
+        pthread_mutex_unlock(&mutex_filter);
+        pthread_mutex_unlock(&mutex_noise);
+        pthread_mutex_unlock(&mutex_val);
+    
+        printf("Sono del thread filtering \n");
+        // 4) invio UN messaggio che contiene tutti i campi
+        if (mq_send(my_queue, (const char*)&msg, sizeof(msg), 0) == -1) {
+            perror("mq_send");
+            // se apri O_NONBLOCK e la coda è piena -> errno == EAGAIN
+            exit(EXIT_FAILURE);
+        }
     }	
 }
 
 
 int main()
 {
-    //implemantazione dei mutex, si usa come protocollo il Priority ceiling
+    //---------------IMPLEMENTAZIONE DEI MUTEX----------------------- 
+    // si usa come protocollo il Priority ceiling
     int ceiling = 80; // si setta il ceiling al massimo delle priorità tra tutti i thread che possono prendere quel mutex
     pthread_mutexattr_t mymutexattr; //attributo generale per una variabile mutex 
     pthread_mutexattr_init(&mymutexattr); //inizializazzione della variabile
@@ -117,19 +172,37 @@ int main()
     pthread_mutex_init(&mutex_val, &mymutexattr);
     //inizializzazione del mutex per la variabile sig_filter
     pthread_mutex_init(&mutex_filter, &mymutexattr);
-
+    //inizializzazione del mutex per la variabile t
+    pthread_mutex_init(&mutex_time, &mymutexattr);
 
     // distruzione attributo dei mutex
     pthread_mutexattr_destroy(&mymutexattr);
 
-    //implementazione dei thread
+    //---------------IMPLEMENTAZIONE CODA----------------------- 
+    //paramentri della coda
+    struct mq_attr attr_queue;
+    attr_queue.mq_flags = 0;
+    attr_queue.mq_maxmsg = MAX_MSG;
+    attr_queue.mq_msgsize = sizeof(sample_msg_t);
+    printf("%ld", attr_queue.mq_msgsize);
+    attr_queue.mq_curmsgs = 0;
+
+
+    if((my_queue = mq_open(MQ_NAME, O_CREAT | O_WRONLY , 0644, &attr_queue)) == -1){//accesso alla coda in sola scrittura (apertira non bloccante)
+        perror("Errore nella creazione e apertura della coda \n");
+        exit(1);
+    }
+    printf("producer mq_open -> %d\n", (int)my_queue);
+
+
+    //---------------IMPLEMENTAZIONE DEI THREAD----------------------- 
     pthread_t th_gen;       //thd1 = th_gen
     pthread_t th_filter;
 
     periodic_thread TH_gen;
     periodic_thread TH_filter;
 
-    //IMPLEMENTAZIONE THREAD
+    //implementazione attributo per i thread
     pthread_attr_t attr;
     struct sched_param par;
 
@@ -157,8 +230,12 @@ int main()
     //distruzione attributo dei thread 
     pthread_attr_destroy(&attr);
 
+    mq_close(my_queue);
+
     while(1) {
-        if(getchar()=='q') break;
+        if(getchar()=='q') 
+        printf("Processo terminato con sucesso!\n");
+        break;
     }
 
     return 0;
