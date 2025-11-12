@@ -10,7 +10,17 @@
 #include <fcntl.h>
 #include <math.h>
 #include "rt-lib.h"
+#include <mqueue.h>
 
+
+// prioprietà per la coda del mse e il suo thread
+#define MSE_QUEUE_NAME "/mse_q"
+#define QUEUE_PERMISSIONS 0660
+#define MAX_MSG_SIZE 256
+#define MAX_MESSAGES 10
+#define T_SAMPLE_MSE 1000000
+
+//proprietà per la generazione del segnale
 #define SIG_SAMPLE SIGRTMIN
 #define SIG_HZ 1.0
 #define OUTFILE "signal.txt"
@@ -23,7 +33,9 @@
 	"\t -n: plot noisy signal\n"		\
 	"\t -f: plot filtered signal\n"		\
 	""
-	
+
+
+
 // 2nd-order Butterw. filter, cutoff at 2Hz @ fc = 50Hz
 #define BUTTERFILT_ORD 2
 double b [3] = {0.0134,    0.0267,    0.0134};
@@ -38,6 +50,18 @@ double get_mean_filter(double cur);
 int flag_signal = 0;
 int flag_noise = 0;
 int flag_filtered = 0;
+
+
+//dichiarazioni variabili per il calcolo del mse
+#define N_SAMPLES 50
+
+double sig_original[N_SAMPLES];         //buffer originale
+int index_sig_og = 0;
+double sig_filtered_buf[N_SAMPLES];     //buffer filtrato
+int index_sig_filt = 0;
+
+pthread_mutex_t mutex_sig_buffers;      //risorsa condivisa per accedere ai buffer
+
 
 //dichiarazione variabili per le risorse condivise
 double sig_noise;
@@ -63,6 +87,12 @@ void* generation (void * parameter)
         
         pthread_mutex_lock(&mutex_val);//wait sulla risorsa sig_val
         sig_val = sin(2*M_PI*SIG_HZ*t);
+        
+        //salva il segnale originale nel buffer 
+        pthread_mutex_lock(&mutex_sig_buffers);  //wait sul buffer
+        sig_original[index_sig_og % N_SAMPLES] = sig_val;
+        index_sig_og = (index_sig_og + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_sig_buffers);    //signal sul buffer
 
         // Add noise to signal
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
@@ -96,10 +126,64 @@ void* filtering (void * parameter)
         //sig_filt = get_butter(sig_noise, a, b);
 	    sig_filt = get_mean_filter(sig_noise);
 
+        //salva il segnale originale nel buffer 
+        pthread_mutex_lock(&mutex_sig_buffers);  //wait sul buffer
+        sig_filtered_buf[index_sig_filt % N_SAMPLES] = sig_filt;
+        index_sig_filt = (index_sig_filt + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_sig_buffers);    //signal sul buffer
+
         pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
     }	
 }
+
+// Thread calcolo MSE
+void* calculate_mse(void* param) {
+    periodic_thread *mse = (periodic_thread*)param;
+    start_periodic_timer(mse, mse->period);
+
+    mqd_t mq_mse;
+    struct mq_attr attr;
+    attr.mq_flags = 0;
+    attr.mq_maxmsg = MAX_MESSAGES;
+    attr.mq_msgsize = MAX_MSG_SIZE;
+    attr.mq_curmsgs = 0;
+
+    mq_mse = mq_open(MSE_QUEUE_NAME, O_WRONLY | O_CREAT, QUEUE_PERMISSIONS, &attr);
+    if (mq_mse == -1) { perror("calculate_mse: mq_open"); pthread_exit(NULL); }
+
+    double local_original[N_SAMPLES];
+    double local_filtered[N_SAMPLES];
+
+    while(1) {
+        wait_next_activation(mse);
+        //printf("MSE thread activated\n"); fflush(stdout);
+
+        pthread_mutex_lock(&mutex_sig_buffers);
+        memcpy(local_original, sig_original, sizeof(sig_original));
+        memcpy(local_filtered, sig_filtered_buf, sizeof(sig_filtered_buf));
+        pthread_mutex_unlock(&mutex_sig_buffers);
+
+        double mse_val = 0.0;
+        for (int i=0; i<N_SAMPLES; i++) {
+            double diff = local_original[i] - local_filtered[i];
+            mse_val += diff * diff;
+        }
+        mse_val /= N_SAMPLES;
+
+        char msg[MAX_MSG_SIZE];
+        snprintf(msg, sizeof(msg), "%f", mse_val);
+        if (mq_send(mq_mse, msg, strlen(msg)+1, 0) == -1) {
+            perror("calculate_mse: mq_send");
+        }
+
+        //debug
+        //printf("Current MSE: %f\n", mse_val);
+    }
+    mq_close(mq_mse);
+    return NULL;
+}
+
 
 
 int main()
@@ -114,7 +198,7 @@ int main()
     //inizializzazione del mutex per la variabile sig_noise
     pthread_mutex_init(&mutex_noise, &mymutexattr);
     //inizializzazione del mutex per la variabile sig_val
-    pthread_mutex_init(&mutex_val, &mymutexattr);
+    pthread_mutex_init(&mutex_val, &mymutexattr);   
     //inizializzazione del mutex per la variabile sig_filter
     pthread_mutex_init(&mutex_filter, &mymutexattr);
 
@@ -123,43 +207,45 @@ int main()
     pthread_mutexattr_destroy(&mymutexattr);
 
     //implementazione dei thread
-    pthread_t th_gen;       //thd1 = th_gen
-    pthread_t th_filter;
-
-    periodic_thread TH_gen;
-    periodic_thread TH_filter;
-
-    //IMPLEMENTAZIONE THREAD
+    pthread_t th_gen, th_filter, th_mse;
+    periodic_thread TH_gen, TH_filter, TH_mse;
     pthread_attr_t attr;
     struct sched_param par;
+
 
     pthread_attr_init(&attr);
     pthread_attr_setschedpolicy(&attr,SCHED_FIFO);
     pthread_attr_setinheritsched(&attr,PTHREAD_EXPLICIT_SCHED);
 
+    
     //THREAD GENERAZIONE SEGNALE
-    TH_gen.index = 1;
-    TH_gen.period = T_SAMPLE;
-    TH_gen.priority = 80;
-    par.sched_priority= TH_gen.priority;
-    pthread_attr_setschedparam(&attr,&par);
+    TH_gen.index = 1; TH_gen.period = T_SAMPLE; TH_gen.priority = 80;
+    par.sched_priority = TH_gen.priority;
+    pthread_attr_setschedparam(&attr, &par);
     pthread_create(&th_gen, &attr, generation, &TH_gen);
 
 
     //THREAD FILTRAGGIO SEGNALE
-    TH_filter.index = 2;
-    TH_filter.period = T_SAMPLE;
-    TH_filter.priority = 70;
-    par.sched_priority= TH_filter.priority;
-    pthread_attr_setschedparam(&attr,&par);
+    TH_filter.index = 2; TH_filter.period = T_SAMPLE; TH_filter.priority = 70;
+    par.sched_priority = TH_filter.priority;
+    pthread_attr_setschedparam(&attr, &par);
     pthread_create(&th_filter, &attr, filtering, &TH_filter);
     
+
+    //THREAD CALCOLO MSE
+    TH_mse.index = 3; TH_mse.period = T_SAMPLE_MSE; TH_mse.priority = 60;
+    par.sched_priority = TH_mse.priority;
+    pthread_attr_setschedparam(&attr, &par);
+    pthread_create(&th_mse, &attr, calculate_mse, &TH_mse);
+
+
     //distruzione attributo dei thread 
     pthread_attr_destroy(&attr);
 
     while(1) {
         if(getchar()=='q') break;
     }
+
 
     return 0;
 }
@@ -215,3 +301,4 @@ double get_mean_filter(double cur)
 	}
 	return retval;
 }
+
