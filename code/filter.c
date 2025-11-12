@@ -13,8 +13,7 @@
 
 #define SIG_SAMPLE SIGRTMIN
 #define SIG_HZ 1.0
-#define OUTFILE "signal.txt"
-#define T_SAMPLE 20000
+#define T_SAMPLE 20000      //50 Hz
 
 
 #define USAGE_STR				\
@@ -35,9 +34,9 @@ double get_butter(double cur, double * a, double * b);
 double get_mean_filter(double cur);
 
 /* Global flags reflecting the command line parameters */
-int flag_signal = 0;
-int flag_noise = 0;
-int flag_filtered = 0;
+// int flag_signal = 0;
+// int flag_noise = 0;
+// int flag_filtered = 0;
 
 //dichiarazione variabili per le risorse condivise
 double sig_noise;
@@ -57,10 +56,11 @@ void* generation (void * parameter)
     // Generate signal
     const double Ts = T_SAMPLE/1e6;         //sample time in secondi
     double t = 0.0;
+    //printf("Thread 1 in corso");
 
     while(1){
+        //printf("thread 1 iniziato");
         wait_next_activation(gen);
-        
         pthread_mutex_lock(&mutex_val);//wait sulla risorsa sig_val
         sig_val = sin(2*M_PI*SIG_HZ*t);
 
@@ -77,7 +77,8 @@ void* generation (void * parameter)
         pthread_mutex_unlock(&mutex_val);//signal sulla risorsa sig_val
 
         t += Ts; /* Sampling period in s */
-        
+        sleep(1);
+        printf("Thread 1 in corso, il segnale rumoroso è: %lf\n", sig_noise);
     }	
 }
 
@@ -147,7 +148,7 @@ int main()
     //THREAD FILTRAGGIO SEGNALE
     TH_filter.index = 2;
     TH_filter.period = T_SAMPLE;
-    TH_filter.priority = 70;
+    TH_filter.priority = 80;
     par.sched_priority= TH_filter.priority;
     pthread_attr_setschedparam(&attr,&par);
     pthread_create(&th_filter, &attr, filtering, &TH_filter);
@@ -156,7 +157,9 @@ int main()
     pthread_attr_destroy(&attr);
 
     while(1) {
-        if(getchar()=='q') break;
+        if(getchar()=='q'){
+            printf("Processo terminato con successo!\n");
+            break;}
     }
 
     return 0;
@@ -203,7 +206,12 @@ double get_mean_filter(double cur)
 
 	//printf("in[0]: %f, in[1]: %f\n", in[0], in[1]); //DEBUG
 
-	// Compute filtered value
+	// Compute filtered value1 I root        7525       2 TS   19 -     0 -      09:54 ?        00:00:00 [kworker/2:2-kacpi_notify]
+5 S giacomo     7526    4272 TS   19 - 611614 poll_s 09:54 ?       00:00:00 /snap/firefox/7177/usr/lib/firefox/firefo
+1 I root        7557       2 TS   19 -     0 -      09:54 ?        00:00:00 [kworker/u32:2-events_unbound]
+4 S root        7629    6366 TS   19 -  3593 -      09:55 pts/1    00:00:00 sudo ./filter
+1 S root        7630    7629 TS   19 -  3593 -      09:55 pts/0    00:00:00 sudo ./filter
+4 S root        7631    7630 TS   19 - 3779
 	if (first_mean == 0){
 		retval = vec_mean[0];
 		first_mean ++;
