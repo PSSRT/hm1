@@ -15,8 +15,7 @@
 
 #define SIG_SAMPLE SIGRTMIN
 #define SIG_HZ 1.0
-#define OUTFILE "signal.txt"
-#define T_SAMPLE 20000 // 50 Hz
+#define T_SAMPLE 20000      //50 Hz
 
 #define USAGE_STR				\
 	"Usage: %s [-s] [-n] [-f]\n"		\
@@ -29,7 +28,6 @@
 #define BUTTERFILT_ORD 2
 double b [3] = {0.0134,    0.0267,    0.0134};
 double a [3] = {1.0000,   -1.6475,    0.7009};
-
 
 //Variabili per la coda
 #define MQ_NAME "/print_q" //nome della coda
@@ -45,35 +43,38 @@ typedef struct{
 
 mqd_t my_queue;
 
+static int first_mean=0;
 
-//variabili per le risorse condivise
+double get_butter(double cur, double * a, double * b);
+double get_mean_filter(double cur);
+
+/* Global flags reflecting the command line parameters */
+// int flag_signal = 0;
+// int flag_noise = 0;
+// int flag_filtered = 0;
+
+//dichiarazione variabili per le risorse condivise
 double sig_noise;
 double sig_val;
 double sig_filt;
-double t = 0.0; 
+double t=0.0;
 
 pthread_mutex_t mutex_noise;
 pthread_mutex_t mutex_val;
 pthread_mutex_t mutex_filter;
 pthread_mutex_t mutex_time;
 
-//PROTOTIPI DI FUNZIONI
-double get_butter(double cur, double * a, double * b);
-double get_mean_filter(double cur);
-
-static int first_mean=0;
 
 void* generation (void * parameter)
 {
     //si usa la libreria pthread.h per creare generare il thread
     periodic_thread *gen = (periodic_thread *) parameter;//non necessario 'struct' perche nel file rt-lib.h è definita come typedef
     start_periodic_timer(gen, gen->period);
-    //Generate signal
-    const double Ts = T_SAMPLE/1e6;         //sample time in secondi
+    // Generate signal
+    const double Ts = T_SAMPLE/1e6;         //sample time in secondi    
 
     while(1){
         wait_next_activation(gen);
-        
         double t_local;
         pthread_mutex_lock(&mutex_time);
         t_local = t; /* Sampling period in s */
@@ -101,11 +102,10 @@ void* generation (void * parameter)
         pthread_mutex_lock(&mutex_time);
         t += Ts; /* Sampling period in s */
         pthread_mutex_unlock(&mutex_time);
-
+        //sleep(1);
+        printf("Thread 1 in corso\n");
     }	
 }
-
-
 
 void* filtering (void * parameter)
 {
@@ -115,7 +115,6 @@ void* filtering (void * parameter)
     // Filtering signal
     while(1){
         wait_next_activation(filter);
-        
         double sig_noise_local;//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
         sig_noise_local = sig_noise;//assegno alla risorsa condivisa ail valore della variabile locale
@@ -145,21 +144,60 @@ void* filtering (void * parameter)
         pthread_mutex_unlock(&mutex_noise);
         pthread_mutex_unlock(&mutex_val);
     
-        printf("Sono del thread filtering \n");
-        // 4) invio UN messaggio che contiene tutti i campi
+        //sleep(1.5);
+        printf("Thread 2 in corso\n");
+         // 4) invio UN messaggio che contiene tutti i campi
         if (mq_send(my_queue, (const char*)&msg, sizeof(msg), 0) == -1) {
             perror("mq_send");
             // se apri O_NONBLOCK e la coda è piena -> errno == EAGAIN
             exit(EXIT_FAILURE);
         }
-    }	
+    }
 }
+
+//DEBUG PRINT_ Q
+void* storage(void *parameter)
+{
+    periodic_thread *store = (periodic_thread *) parameter;
+    start_periodic_timer(store, store->period);
+
+    // Apertura della coda in sola lettura
+    mqd_t mq;
+    if ((mq = mq_open(MQ_NAME, O_RDONLY)) == -1) {
+        perror("Errore apertura coda in lettura");
+        pthread_exit((void*)EXIT_FAILURE);
+    }
+
+    sample_msg_t msg;
+    ssize_t n;
+
+    while (1) {
+        wait_next_activation(store);
+
+        // ricezione bloccante
+        do {
+            n = mq_receive(mq, (char*)&msg, sizeof(msg), NULL);
+        } while (n == -1 && errno == EINTR); // riprova se interrotto da un segnale
+
+        if (n == -1) {
+            perror("mq_receive");
+            pthread_exit((void*)EXIT_FAILURE);
+        }
+
+        // Stampa del messaggio ricevuto
+        printf("[STORE] t=%.6f | val=%.3f | noise=%.3f | filt=%.3f\n",
+               msg.t, msg.val, msg.noise, msg.filt);
+    }
+
+    mq_close(mq);
+    pthread_exit(NULL);
+}
+
 
 
 int main()
 {
-    //---------------IMPLEMENTAZIONE DEI MUTEX----------------------- 
-    // si usa come protocollo il Priority ceiling
+    //implementazione dei mutex, si usa come protocollo il Priority ceiling
     int ceiling = 80; // si setta il ceiling al massimo delle priorità tra tutti i thread che possono prendere quel mutex
     pthread_mutexattr_t mymutexattr; //attributo generale per una variabile mutex 
     pthread_mutexattr_init(&mymutexattr); //inizializazzione della variabile
@@ -178,6 +216,7 @@ int main()
     // distruzione attributo dei mutex
     pthread_mutexattr_destroy(&mymutexattr);
 
+    
     //---------------IMPLEMENTAZIONE CODA----------------------- 
     //paramentri della coda
     struct mq_attr attr_queue;
@@ -194,15 +233,14 @@ int main()
     }
     printf("producer mq_open -> %d\n", (int)my_queue);
 
-
-    //---------------IMPLEMENTAZIONE DEI THREAD----------------------- 
+    //implementazione dei thread
     pthread_t th_gen;       //thd1 = th_gen
     pthread_t th_filter;
 
-    periodic_thread TH_gen;
-    periodic_thread TH_filter;
+    periodic_thread * TH_gen = malloc(sizeof(periodic_thread));
+    periodic_thread * TH_filter = malloc(sizeof(periodic_thread));
 
-    //implementazione attributo per i thread
+    //IMPLEMENTAZIONE THREAD
     pthread_attr_t attr;
     struct sched_param par;
 
@@ -211,37 +249,47 @@ int main()
     pthread_attr_setinheritsched(&attr,PTHREAD_EXPLICIT_SCHED);
 
     //THREAD GENERAZIONE SEGNALE
-    TH_gen.index = 1;
-    TH_gen.period = T_SAMPLE;
-    TH_gen.priority = 80;
-    par.sched_priority= TH_gen.priority;
+    TH_gen->index = 1;
+    TH_gen->period = T_SAMPLE;
+    TH_gen->priority = 80;
+    par.sched_priority= TH_gen->priority;
     pthread_attr_setschedparam(&attr,&par);
-    pthread_create(&th_gen, &attr, generation, &TH_gen);
+    pthread_create(&th_gen, &attr, generation, TH_gen);
 
 
     //THREAD FILTRAGGIO SEGNALE
-    TH_filter.index = 2;
-    TH_filter.period = T_SAMPLE;
-    TH_filter.priority = 70;
-    par.sched_priority= TH_filter.priority;
+    TH_filter->index = 2;
+    TH_filter->period = T_SAMPLE;
+    TH_filter->priority = 80;
+    par.sched_priority= TH_filter->priority;
     pthread_attr_setschedparam(&attr,&par);
-    pthread_create(&th_filter, &attr, filtering, &TH_filter);
+    pthread_create(&th_filter, &attr, filtering, TH_filter);
     
+    //debug print_q
+    // THREAD STORAGE (riceve i dati e li stampa)
+    pthread_t th_store;
+    periodic_thread *TH_store = malloc(sizeof(periodic_thread));
+
+    TH_store->index = 3;
+    TH_store->period = 200000; // ogni 200 ms (5 Hz)
+    TH_store->priority = 70;   // priorità più bassa del filtering
+
+    par.sched_priority = TH_store->priority;
+    pthread_attr_setschedparam(&attr, &par);
+    pthread_create(&th_store, &attr, storage, TH_store);
+
+
+
     //distruzione attributo dei thread 
     pthread_attr_destroy(&attr);
-
-    //pthread_join(th_gen, NULL);//attesa sulla fine dei thread per non chiudere la coda preventivamente
-    //pthread_join(th_filter, NULL);
-    
     while(1) {
         if(getchar()=='q'){
-        printf("Processo terminato con sucesso!\n");
-        break;}
+            printf("Processo terminato con sucesso!\n");
+            break;
+        }
     }
-
     mq_close(my_queue);
     mq_unlink(MQ_NAME);
-
     return 0;
 }
 
@@ -285,8 +333,6 @@ double get_mean_filter(double cur)
 	vec_mean[0] = cur;
 
 	//printf("in[0]: %f, in[1]: %f\n", in[0], in[1]); //DEBUG
-
-	// Compute filtered value
 	if (first_mean == 0){
 		retval = vec_mean[0];
 		first_mean ++;
@@ -296,4 +342,3 @@ double get_mean_filter(double cur)
 	}
 	return retval;
 }
-
