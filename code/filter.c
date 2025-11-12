@@ -184,6 +184,24 @@ void* calculate_mse(void* param) {
     return NULL;
 }
 
+//DEBUG MSE
+void* read_mse(void* param) {
+    (void)param;
+    mqd_t mq_mse = mq_open(MSE_QUEUE_NAME, O_RDONLY);
+    if (mq_mse == -1) { perror("mq_open read"); return NULL; }
+
+    char msg[MAX_MSG_SIZE];
+    while(1) {
+        ssize_t n = mq_receive(mq_mse, msg, sizeof(msg), NULL);
+        if(n >= 0) {
+            printf("MSE value: %s\n", msg);
+            fflush(stdout);
+        }
+    }
+
+    mq_close(mq_mse);
+    return NULL;
+}
 
 
 int main()
@@ -237,6 +255,9 @@ int main()
     par.sched_priority = TH_mse.priority;
     pthread_attr_setschedparam(&attr, &par);
     pthread_create(&th_mse, &attr, calculate_mse, &TH_mse);
+    //DEBUG
+    pthread_t th_read;
+    pthread_create(&th_read, NULL, read_mse, NULL);
 
 
     //distruzione attributo dei thread 
