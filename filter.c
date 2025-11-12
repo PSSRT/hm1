@@ -230,13 +230,17 @@ int main()
     //distruzione attributo dei thread 
     pthread_attr_destroy(&attr);
 
-    mq_close(my_queue);
-
+    //pthread_join(th_gen, NULL);//attesa sulla fine dei thread per non chiudere la coda preventivamente
+    //pthread_join(th_filter, NULL);
+    
     while(1) {
-        if(getchar()=='q') 
+        if(getchar()=='q'){
         printf("Processo terminato con sucesso!\n");
-        break;
+        break;}
     }
+
+    mq_close(my_queue);
+    mq_unlink(MQ_NAME);
 
     return 0;
 }
