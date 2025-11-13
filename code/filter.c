@@ -52,7 +52,7 @@ double get_mean_filter(double cur);
 //Variabili per il calcolo di mse
 #define MSE_QUEUE_NAME "/mse_q"
 #define T_SAMPLE_MSE 1000000      //1 Hz
-#define MAX_MSG_MSE 8 //massimo numero di messaggi
+#define MAX_MSG_MSE 10 //massimo numero di messaggi
 #define MAX_MSG_SIZE 256
 mqd_t queue_mse;
 
@@ -84,6 +84,8 @@ void* generation (void * parameter)
     // Generate signal
     const double Ts = T_SAMPLE/1e6;         //sample time in secondi    
 
+
+    printf("[FILTER] Thread di generation avviato (50 Hz)\n");
     while(1){
         wait_next_activation(gen);
         double t_local;
@@ -129,6 +131,8 @@ void* filtering (void * parameter)
     periodic_thread *filter= (periodic_thread *) parameter;
     start_periodic_timer(filter, filter->period);
 
+
+    printf("[FILTER] Thread di filtering avviato (50 Hz)\n");
     // Filtering signal
     while(1){
         wait_next_activation(filter);
@@ -185,6 +189,8 @@ void* calculate_mse (void * parameter)
     double local_original[N_SAMPLES];
     double local_filtered[N_SAMPLES];
 
+
+    printf("[FILTER] Thread di calculate_mse avviato (1 Hz)\n");
     while(1)
     {
         wait_next_activation(mse);
@@ -201,16 +207,13 @@ void* calculate_mse (void * parameter)
         }
         mse_val = mse_val/N_SAMPLES;
 
-        printf("Thread 3 in corso\n");
-
         //sending the message on the queue
         char msg[MAX_MSG_SIZE];
         snprintf(msg,sizeof(msg),"%f",mse_val);
-        printf("%s\n", msg);
         if(mq_send(queue_mse,msg,strlen(msg)+1,0) == -1){
             perror("calculate_mse:mq_send");
             exit(EXIT_FAILURE);
-        }
+        }//else printf("msg %s\n", msg); //debug
     }
 }
 
@@ -248,7 +251,7 @@ int main()
         exit(1);
     }
 
-    printf("coda del segnale creata con successo!\n");
+    printf("[FILTER] Coda /print_q aperta in scrittura.\n");
 
     //---------------IMPLEMENTAZIONE CODA MSE----------------------- 
     //paramentri della coda
@@ -264,7 +267,7 @@ int main()
         exit(1);
     }
 
-    printf("coda dell'errore quadratico medio creata con successo!\n");
+    printf("[FILTER] Coda /mse_q aperta in scrittura.\n");
     
     //implementazione dei thread
     pthread_t th_gen;       //thd1 = th_gen

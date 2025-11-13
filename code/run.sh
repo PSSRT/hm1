@@ -1,5 +1,6 @@
 #!/bin/bash
 
+
 # Launch the first C program
 ./store &
 # Store its PID
@@ -9,6 +10,8 @@ STORE_PID=$!
 ./filter $1 &
 # Store its PID
 FILTER_PID=$!
+
+
 
 # Function to kill all processes
 kill_processes() {
