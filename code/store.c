@@ -102,6 +102,8 @@ int main(int argc, char **argv) {
     attr_queue.mq_curmsgs = 0;
 
     // Apertura coda in lettura non bloccante
+    mq_close(my_queue);
+    mq_unlink(MQ_NAME);
     if ((my_queue = mq_open(MQ_NAME, O_CREAT | O_RDONLY | O_NONBLOCK, 0644, &attr_queue)) == -1) {
         perror("Errore nella creazione e apertura della coda");
         exit(EXIT_FAILURE);
@@ -112,22 +114,10 @@ int main(int argc, char **argv) {
     pthread_t th_store;
     periodic_thread TH_store;
 
-    //pthread_attr_t attr;      % il thread store non deve essere real time!
-    //struct sched_param par;
-
-    //pthread_attr_init(&attr);
-    //pthread_attr_setschedpolicy(&attr, SCHED_FIFO);
-    //pthread_attr_setinheritsched(&attr, PTHREAD_EXPLICIT_SCHED);
-
     // Thread storage
     TH_store.index = 1;
     TH_store.period = T_SAMPLE;
-    //TH_store.priority = 60;  // priorità minore di filter (che è 80)
-    //par.sched_priority = TH_store.priority;
-    //pthread_attr_setschedparam(&attr, &par);
     pthread_create(&th_store, NULL, storage, &TH_store);
-
-   // pthread_attr_destroy(&attr);
 
     // Attendi terminazione con 'q' da tastiera
     while (1) {
@@ -136,9 +126,6 @@ int main(int argc, char **argv) {
             break;
         }
     }
-
-    mq_close(my_queue);
-    mq_unlink(MQ_NAME);
     return 0;
 }
 

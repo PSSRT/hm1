@@ -50,11 +50,11 @@ double get_butter(double cur, double * a, double * b);
 double get_mean_filter(double cur);
 
 //Variabili per il calcolo di mse
-// #define MSE_QUEUE_NAME "/mse_q"
-// #define T_SAMPLE_MSE 1000000      //1 Hz
-// #define MAX_MSG_MSE 8 //massimo numero di messaggi
-// #define MAX_MSG_SIZE 256
-// mqd_t queue_mse;
+#define MSE_QUEUE_NAME "/mse_q"
+#define T_SAMPLE_MSE 1000000      //1 Hz
+#define MAX_MSG_MSE 8 //massimo numero di messaggi
+#define MAX_MSG_SIZE 256
+mqd_t queue_mse;
 
 
 //dichiarazione variabili per le risorse condivise
@@ -63,16 +63,16 @@ double sig_val;
 double sig_filt;
 double t=0.0;
 
-// double sig_original[N_SAMPLES];
-// int idx_sig_og = 0;
-// double sig_filtered[N_SAMPLES];
-// int idx_sig_filt = 0;
+double sig_original[N_SAMPLES];
+int idx_sig_og = 0;
+double sig_filtered[N_SAMPLES];
+int idx_sig_filt = 0;
 
 pthread_mutex_t mutex_noise;    //-> protegge la risorsa condivisa sig_noise
 pthread_mutex_t mutex_val;      //-> protegge la risorsa condivisa sig_val
 pthread_mutex_t mutex_filter;   //-> protegge la risorsa condivisa sig_filt
 pthread_mutex_t mutex_time;     //-> protegge la risorsa condivisa t
-//pthread_mutex_t mutex_mse;      //-> protegge le risorse condivise sig_original e sig_filtered che sono due buffer da 50 campioni
+pthread_mutex_t mutex_mse;      //-> protegge le risorse condivise sig_original e sig_filtered che sono due buffer da 50 campioni
 
 
 
@@ -111,16 +111,16 @@ void* generation (void * parameter)
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
 
         //salva il segnale originale nel buffer 
-        // pthread_mutex_lock(&mutex_mse);  //wait sul buffer
-        // sig_original[idx_sig_og % N_SAMPLES] = sig_val_local;
-        // idx_sig_og = (idx_sig_og + 1) % N_SAMPLES;
-        // pthread_mutex_unlock(&mutex_mse);    //signal sul buffer
+        pthread_mutex_lock(&mutex_mse);  //wait sul buffer
+        sig_original[idx_sig_og % N_SAMPLES] = sig_val_local;
+        idx_sig_og = (idx_sig_og + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_mse);    //signal sul buffer
 
         
         pthread_mutex_lock(&mutex_time);
         t += Ts; /* Sampling period in s */
         pthread_mutex_unlock(&mutex_time);
-        printf("Thread 1 in corso\n");
+        //printf("Thread 1 in corso\n");
     }	
 }
 
@@ -144,10 +144,10 @@ void* filtering (void * parameter)
         pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
 
         //salva il segnale originale nel buffer 
-        // pthread_mutex_lock(&mutex_mse);  //wait sul buffer
-        // sig_filtered[idx_sig_filt % N_SAMPLES] = sig_filt_local;
-        // idx_sig_filt = (idx_sig_filt + 1) % N_SAMPLES;
-        // pthread_mutex_unlock(&mutex_mse);    //signal sul buffer
+        pthread_mutex_lock(&mutex_mse);  //wait sul buffer
+        sig_filtered[idx_sig_filt % N_SAMPLES] = sig_filt_local;
+        idx_sig_filt = (idx_sig_filt + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_mse);    //signal sul buffer
 
         //creazione del messaggio da mandare nella coda 
         sample_msg_t msg;
@@ -167,7 +167,7 @@ void* filtering (void * parameter)
         pthread_mutex_unlock(&mutex_noise);
         pthread_mutex_unlock(&mutex_val);
     
-        printf("Thread 2 in corso\n");
+        //printf("Thread 2 in corso\n");
         // 4) invio UN messaggio che contiene tutti i campi
         if (mq_send(queue_sig, (const char*)&msg, sizeof(msg), 0) == -1) {
             perror("mq_send"); // se apri O_NONBLOCK e la coda è piena -> errno == EAGAIN
@@ -177,42 +177,42 @@ void* filtering (void * parameter)
 }
 
 
-// void* calculate_mse (void * parameter)
-// {
-//     periodic_thread *mse= (periodic_thread *) parameter;
-//     start_periodic_timer(mse, mse->period);
+void* calculate_mse (void * parameter)
+{
+    periodic_thread *mse= (periodic_thread *) parameter;
+    start_periodic_timer(mse, mse->period);
 
-//     double local_original[N_SAMPLES];
-//     double local_filtered[N_SAMPLES];
+    double local_original[N_SAMPLES];
+    double local_filtered[N_SAMPLES];
 
-//     while(1)
-//     {
-//         wait_next_activation(mse);
-//         pthread_mutex_lock(&mutex_mse);
-//         memcpy(local_original, sig_original, sizeof(sig_original));
-//         memcpy(local_filtered, sig_filtered, sizeof(sig_filtered));
-//         pthread_mutex_unlock(&mutex_mse);
+    while(1)
+    {
+        wait_next_activation(mse);
+        pthread_mutex_lock(&mutex_mse);
+        memcpy(local_original, sig_original, sizeof(sig_original));
+        memcpy(local_filtered, sig_filtered, sizeof(sig_filtered));
+        pthread_mutex_unlock(&mutex_mse);
 
-//         double mse_val = 0.0;
-//         double diff;
-//         for (int i=0; i<N_SAMPLES; i++){
-//             diff = local_original[i] - local_filtered[i];
-//             mse_val = mse_val + diff*diff;
-//         }
-//         mse_val = mse_val/N_SAMPLES;
+        double mse_val = 0.0;
+        double diff;
+        for (int i=0; i<N_SAMPLES; i++){
+            diff = local_original[i] - local_filtered[i];
+            mse_val = mse_val + diff*diff;
+        }
+        mse_val = mse_val/N_SAMPLES;
 
-//         printf("Thread 3 in corso\n");
+        printf("Thread 3 in corso\n");
 
-//         //sending the message on the queue
-//         char msg[MAX_MSG_SIZE];
-//         snprintf(msg,sizeof(msg),"%f",mse_val);
-//         printf("%s\n", msg);
-//         if(mq_send(queue_mse,msg,strlen(msg)+1,0) == -1){
-//             perror("calculate_mse:mq_send");
-//             exit(EXIT_FAILURE);
-//         }
-//     }
-// }
+        //sending the message on the queue
+        char msg[MAX_MSG_SIZE];
+        snprintf(msg,sizeof(msg),"%f",mse_val);
+        printf("%s\n", msg);
+        if(mq_send(queue_mse,msg,strlen(msg)+1,0) == -1){
+            perror("calculate_mse:mq_send");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
 
 int main()
 {
@@ -227,7 +227,7 @@ int main()
     pthread_mutex_init(&mutex_val, &mymutexattr);     //inizializzazione del mutex per la variabile sig_val
     pthread_mutex_init(&mutex_filter, &mymutexattr);  //inizializzazione del mutex per la variabile sig_filter
     pthread_mutex_init(&mutex_time, &mymutexattr);    //inizializzazione del mutex per la variabile t
-    //pthread_mutex_init(&mutex_mse, &mymutexattr);     //inizializzazione del mutex per la variabile mse
+    pthread_mutex_init(&mutex_mse, &mymutexattr);     //inizializzazione del mutex per la variabile mse
 
 
     // distruzione attributo dei mutex
@@ -248,32 +248,32 @@ int main()
         exit(1);
     }
 
-    printf("coda del segnale creata con successo!");
+    printf("coda del segnale creata con successo!\n");
 
     //---------------IMPLEMENTAZIONE CODA MSE----------------------- 
     //paramentri della coda
-    // struct mq_attr attr_queue_mse;
-    // attr_queue_mse.mq_flags = 0;
-    // attr_queue_mse.mq_maxmsg = MAX_MSG_MSE;
-    // attr_queue_mse.mq_msgsize = MAX_MSG_SIZE;      //256 byte
-    // attr_queue_mse.mq_curmsgs = 0;
+    struct mq_attr attr_queue_mse;
+    attr_queue_mse.mq_flags = 0;
+    attr_queue_mse.mq_maxmsg = MAX_MSG_MSE;
+    attr_queue_mse.mq_msgsize = MAX_MSG_SIZE;      //256 byte
+    attr_queue_mse.mq_curmsgs = 0;
 
 
-    // if((queue_mse = mq_open(MSE_QUEUE_NAME, O_CREAT | O_WRONLY , 0660, &attr_queue_mse)) == -1){//accesso alla coda in sola scrittura (apertura non bloccante)
-    //     perror("Errore nella creazione e apertura della coda dell'errore quadratico medio\n");
-    //     exit(1);
-    // }
+    if((queue_mse = mq_open(MSE_QUEUE_NAME, O_CREAT | O_WRONLY , 0660, &attr_queue_mse)) == -1){//accesso alla coda in sola scrittura (apertura non bloccante)
+        perror("Errore nella creazione e apertura della coda dell'errore quadratico medio\n");
+        exit(1);
+    }
 
-    // printf("coda dell'errore quadratico medio creata con successo!");
+    printf("coda dell'errore quadratico medio creata con successo!\n");
     
     //implementazione dei thread
     pthread_t th_gen;       //thd1 = th_gen
     pthread_t th_filter;
-    //pthread_t th_mse;
+    pthread_t th_mse;
 
     periodic_thread * TH_gen = malloc(sizeof(periodic_thread));
     periodic_thread * TH_filter = malloc(sizeof(periodic_thread));    
-    //periodic_thread * TH_mse = malloc(sizeof(periodic_thread));
+    periodic_thread * TH_mse = malloc(sizeof(periodic_thread));
 
     //IMPLEMENTAZIONE THREAD
     pthread_attr_t attr;
@@ -302,12 +302,12 @@ int main()
 
     
     //THREAD CALCOLO MSE
-    // TH_mse->index = 2;
-    // TH_mse->period = T_SAMPLE_MSE;
-    // TH_mse->priority = 60;
-    // par.sched_priority= TH_mse->priority;
-    // pthread_attr_setschedparam(&attr,&par);
-    // pthread_create(&th_mse, &attr, calculate_mse, TH_mse);
+    TH_mse->index = 2;
+    TH_mse->period = T_SAMPLE_MSE;
+    TH_mse->priority = 60;
+    par.sched_priority= TH_mse->priority;
+    pthread_attr_setschedparam(&attr,&par);
+    pthread_create(&th_mse, &attr, calculate_mse, TH_mse);
     
     //distruzione attributo dei thread 
     pthread_attr_destroy(&attr);
@@ -321,8 +321,8 @@ int main()
     mq_close(queue_sig);
     mq_unlink(MQ_NAME);
 
-    // mq_close(queue_mse);
-    // mq_unlink(MSE_QUEUE_NAME);
+    mq_close(queue_mse);
+    mq_unlink(MSE_QUEUE_NAME);
     return 0;
 }
 

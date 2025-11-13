@@ -67,5 +67,5 @@ def animate(i):
     if (len(ws) > 0):    
         ax1.plot(xs, ws)
 
-ani = animation.FuncAnimation(fig, animate, interval=5)
+ani = animation.FuncAnimation(fig, animate, interval=5, cache_frame_data=False)
 plt.show()
