@@ -1,18 +1,30 @@
-1) To compile the demo, use the command:
-gcc -o filter filter.c rt-lib.c store.c -lm -lrt -lpthread -Wall
-
-or, only:
+To compile the filter file, open a terminal and use the command:
 
 gcc -o filter filter.c rt-lib.c -lm -lrt -lpthread -Wall
 
-2) Run the filter app:
-./filter
 
-To test the demo: 
+Compile the store file:
 
-1) In a different shell launch the python script: 
+gcc -o store store.c rt-lib.c -lm -lrt -lpthread -Wall
+
+
+Run the filter and the store app simultaneously with:
+
+bash run.sh
+
+
+Finally open a different shell and launch the python script: 
+
 python3 live_plot.py
 
+
+In the code provided by the instructor, after compiling filter run it with:
+
+./filter -s 
+./filter -n
+./filter -f
+
+to plot only one of the signals 
 
 
 USEFUL GITHUB COMMANDS:
