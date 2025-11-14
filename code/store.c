@@ -23,20 +23,20 @@
     "\t -f: plot filtered signal\n" \
     ""
 
-
 // Flag per il plotting
 int flag_signal = 0;
 int flag_noise = 0;
 int flag_filtered = 0;
 
-// Variabili per la coda
+// Variabili per la coda print_q
 #define MQ_NAME "/print_q"   // nome della coda condivisa
 #define MAX_MSG 10           // massimo numero di messaggi nella coda
+mqd_t my_queue;
 
 // Variabili per la coda mse
 #define MSE_QUEUE_NAME "/mse_q"
 #define T_SAMPLE_MSE 1000000      // 1 Hz
-#define MAX_MSG_MSE 100             // massimo numero di messaggi
+#define MAX_MSG_MSE 50             // massimo numero di messaggi
 #define MAX_MSG_SIZE 256
 mqd_t queue_mse;
 
@@ -48,13 +48,17 @@ typedef struct {
     double filt;
 } sample_msg_t;
 
-mqd_t queue_sig;
-
 // Flag di terminazione
-volatile sig_atomic_t stop_flag = 0;
+//volatile sig_atomic_t stop_flag = 0;
 
 // Prototipo funzione parsing linea di comando
-//void parse_cmdline(int argc, char **argv);
+void parse_cmdline(int argc, char **argv);
+
+// Handler per SIGINT (Ctrl+C)
+// static void sigint_handler(int sig) {
+//     (void)sig;
+//     stop_flag = 1;
+// }
 
 // Thread di storage
 void *storage(void *parameter) {
@@ -78,10 +82,10 @@ void *storage(void *parameter) {
         //print_q
         sample_msg_t msg;
         ssize_t n;
-        // Leggi tutti i messaggi disponibili nella coda dei messaggi (senza bloccare)
+        // Leggi tutti i messaggi disponibili nella coda (senza bloccare)
         while (1) {
             errno = 0;
-            n = mq_receive(queue_sig, (char*)&msg, sizeof(msg), NULL);
+            n = mq_receive(my_queue, (char*)&msg, sizeof(msg), NULL);
             if (n == -1) {
                 if (errno == EAGAIN)
                     break;  // nessun messaggio disponibile
@@ -116,9 +120,10 @@ void *storage(void *parameter) {
                 }
             }
 
+           
             // Stampa valore ricevuto
             //printf("[DEBUG] Ricevuto messaggio da /mse_q (%zd byte)\n", m);
-            printf("MSE lato receiver: %s\n", msgm);
+            printf("[STORE] MSE: %s\n", msgm);
             fflush(stdout);
         }
 
@@ -131,7 +136,14 @@ void *storage(void *parameter) {
 
 int main(int argc, char **argv) {
     // Parsing della linea di comando
-    //parse_cmdline(argc, argv);
+    parse_cmdline(argc, argv);
+
+    // Handler per Ctrl+C
+    // struct sigaction sa;
+    // sa.sa_handler = sigint_handler;
+    // sigemptyset(&sa.sa_mask);
+    // sa.sa_flags = 0;
+    // sigaction(SIGINT, &sa, NULL);
 
     //---------------- CREAZIONE CODA -----------------------
     struct mq_attr attr_queue;
@@ -140,14 +152,13 @@ int main(int argc, char **argv) {
     attr_queue.mq_msgsize = sizeof(sample_msg_t);
     attr_queue.mq_curmsgs = 0;
 
-    // Apertura coda /print_q in lettura non bloccante
-    mq_close(queue_sig);
+    // Apertura coda print_q in lettura non bloccante
     mq_unlink(MQ_NAME);
-    if ((queue_sig = mq_open(MQ_NAME, O_CREAT | O_RDONLY | O_NONBLOCK, 0644, &attr_queue)) == -1) {
-        perror("Errore nella creazione e apertura della coda");
+    if ((my_queue = mq_open(MQ_NAME, O_CREAT | O_RDONLY | O_NONBLOCK, 0666, &attr_queue)) == -1) {
+        perror("Errore nella creazione e apertura della coda dei segnali\n");
         exit(EXIT_FAILURE);
     }
-    printf("[STORE] Coda /print_q aperta in lettura.\n");
+    printf("\n[STORE] Coda /print_q aperta in lettura.\n");
 
     // Apertura coda mse in lettura non bloccante
     struct mq_attr attr_mse;
@@ -156,14 +167,12 @@ int main(int argc, char **argv) {
     attr_mse.mq_msgsize = MAX_MSG_SIZE;
     attr_mse.mq_curmsgs = 0;
 
-    //mq_close(queue_mse);
     mq_unlink(MSE_QUEUE_NAME);
-    if ((queue_mse = mq_open(MSE_QUEUE_NAME, O_CREAT | O_RDONLY | O_NONBLOCK, 0644, &attr_mse)) == -1) {
-        perror("Errore nella creazione e apertura della coda");
+    if ((queue_mse = mq_open(MSE_QUEUE_NAME, O_CREAT | O_RDONLY | O_NONBLOCK, 0666, &attr_mse)) == -1) {
+        perror("Errore nella creazione e apertura della coda dell'errore quadratico medio\n");
         exit(EXIT_FAILURE);
     }
     printf("[STORE] Coda /mse_q aperta in lettura.\n");
-
 
     //---------------- CREAZIONE THREAD ---------------------
     pthread_t th_store;
@@ -174,6 +183,14 @@ int main(int argc, char **argv) {
     TH_store.period = T_SAMPLE;
     pthread_create(&th_store, NULL, storage, &TH_store);
 
+    // Attendi terminazione con 'q' da tastiera
+    // printf("Premere 'q' + ENTER o Ctrl-C per terminare.\n");
+    // while (!stop_flag) {
+    //     if (getchar() == 'q') {
+    //         stop_flag = 1;
+    //         break;
+    //     }
+    // }
     // Attendi terminazione con 'q' da tastiera
     while (1) {
         if (getchar() == 'q') {
@@ -186,7 +203,7 @@ int main(int argc, char **argv) {
     pthread_join(th_store, NULL);
 
     // Pulizia finale delle risorse
-    mq_close(queue_sig);
+    mq_close(my_queue);
     mq_unlink(MQ_NAME);
     mq_close(queue_mse);
     mq_unlink(MSE_QUEUE_NAME);
@@ -194,32 +211,22 @@ int main(int argc, char **argv) {
     return 0;
 }
 
-// void parse_cmdline(int argc, char **argv) {
-//     int opt;
+void parse_cmdline(int argc, char **argv) {
+    int opt;
 
-//     while ((opt = getopt(argc, argv, "snf")) != -1) {
-//         switch (opt) {
-//             case 's': flag_signal = 1; break;
-//             case 'n': flag_noise = 1; break;
-//             case 'f': flag_filtered = 1; break;
-//             default:
-//                 fprintf(stderr, USAGE_STR, argv[0]);
-//                 exit(EXIT_FAILURE);
-//         }
-//     }
+    while ((opt = getopt(argc, argv, "snf")) != -1) {
+        switch (opt) {
+            case 's': flag_signal = 1; break;
+            case 'n': flag_noise = 1; break;
+            case 'f': flag_filtered = 1; break;
+            default:
+                fprintf(stderr, USAGE_STR, argv[0]);
+                exit(EXIT_FAILURE);
+        }
+    }
 
-//     // Se nessun flag specificato, abilita tutti
-//     if ((flag_signal | flag_noise | flag_filtered) == 0) {
-//         flag_signal = flag_noise = flag_filtered = 1;
-//     }double apply_filter(double input, int filter_choice) {
-//     switch (filter_choice) {
-//         case 1: // Media mobile
-//             return get_mean_filter(input);
-//         case 2: // Butterworth 2° ordine
-//             return get_butter(input, a, b);
-//         //case 3: // Filtro opzionale (esempio: passa alto)
-//             // return get_highpass(input);
-//             //return input; // placeholder
-//     }
-// }
-// }
+    // Se nessun flag specificato, abilita tutti
+    if ((flag_signal | flag_noise | flag_filtered) == 0) {
+        flag_signal = flag_noise = flag_filtered = 1;
+    }
+}

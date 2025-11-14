@@ -30,7 +30,7 @@
 double b [3] = {0.0134,    0.0267,    0.0134};
 double a [3] = {1.0000,   -1.6475,    0.7009};
 
-//Variabili per la coda dei segnali
+//Variabili per la coda
 #define MQ_NAME "/print_q" //nome della coda
 #define MAX_MSG 10 //massimo numero di messaggi 
 
@@ -47,19 +47,23 @@ mqd_t queue_sig;
 static int first_mean=0;
 int filter_choice = 1; // default filtro media mobile
 
+
 double get_butter(double cur, double * a, double * b);
 double get_mean_filter(double cur);
 double apply_filter(double input, int choice);
 
-//Variabili per la coda dell' mse
+//Variabili per il calcolo di mse
 #define MSE_QUEUE_NAME "/mse_q"
 #define T_SAMPLE_MSE 1000000      //1 Hz
-#define MAX_MSG_MSE 100 //massimo numero di messaggi
+#define MAX_MSG_MSE 50 //massimo numero di messaggi
 #define MAX_MSG_SIZE 256
 mqd_t queue_mse;
 
+volatile int ready = 0;
+const double Ts = T_SAMPLE/1e6;         //sample time in secondi
+
 //dichiarazione variabili per le risorse condivise
-double sig_noise;
+double sig_noise;        
 double t=0.0;
 double sig_original[N_SAMPLES];
 int idx_sig_og = 0;                 // N.B.: ANCHE GLI INDICI VANNO INTERPRETATI COME RISORSE CONDIVISE
@@ -73,12 +77,12 @@ pthread_mutex_t mutex_sig_filtered;      //-> protegge la risorsa condivisa sig_
 
 
 void* generation (void * parameter)
-{ 
+{
+    ready=1; 
     //si usa la libreria pthread.h per creare generare il thread
     periodic_thread *gen = (periodic_thread *) parameter;//non necessario 'struct' perche nel file rt-lib.h è definita come typedef
     start_periodic_timer(gen, gen->period);
     // Generate signal
-    const double Ts = T_SAMPLE/1e6;         //sample time in secondi
     printf("[GENERATION] Thread di generazione del segnale avviato (50 Hz)\n");   
 
     while(1){
@@ -113,6 +117,8 @@ void* generation (void * parameter)
 
 void* filtering (void * parameter)
 {
+    while(!ready) 
+        usleep(5000);
     periodic_thread *filter= (periodic_thread *) parameter;
     start_periodic_timer(filter, filter->period);
     printf("[FILTERING] Thread di filtraggio del segnale avviato (50 Hz)\n");
@@ -125,6 +131,10 @@ void* filtering (void * parameter)
         sig_noise_local = sig_noise;//assegno alla variabile locale il valore della risorsa condivisa
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
 
+        //double sig_filt = get_mean_filter(sig_noise_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        //double sig_filt = get_butter(sig_noise_local,a,b);
+
+        // Applicazione di uno dei filtri definiti
         double sig_filt = apply_filter(sig_noise_local,filter_choice);
 
         //creazione del messaggio da mandare nella coda 
@@ -138,11 +148,11 @@ void* filtering (void * parameter)
         pthread_mutex_unlock(&mutex_sig_filtered);    //signal sul buffer
  
         pthread_mutex_lock(&mutex_time);
-        msg.t = t;
+        msg.t = t-Ts;
         pthread_mutex_unlock(&mutex_time);
 
         pthread_mutex_lock(&mutex_sig_original);
-        msg.val = sig_original[idx_sig_og];
+        msg.val = sig_original[(idx_sig_og + N_SAMPLES - 1) % N_SAMPLES];
         pthread_mutex_unlock(&mutex_sig_original);
         //printf("%lf\nsig_original:", msg.val);
 
@@ -160,6 +170,8 @@ void* filtering (void * parameter)
 
 void* calculate_mse (void * parameter)
 {
+    while(!ready) 
+        usleep(5000);
     periodic_thread *mse= (periodic_thread *) parameter;
     start_periodic_timer(mse, mse->period);
     printf("[CALCULATE] Thread di calcolo dell'mse avviato (1 Hz)\n");
@@ -188,7 +200,7 @@ void* calculate_mse (void * parameter)
         //sending the message on the queue
         char msg[MAX_MSG_SIZE];
         snprintf(msg,sizeof(msg),"%f",mse_val);
-        printf("MSE lato sender:%s\n", msg);
+        //printf("\n[FILTER] MSE:%s", msg);
         if(mq_send(queue_mse,msg,strlen(msg)+1,0) == -1){
             perror("calculate_mse:mq_send");
             exit(EXIT_FAILURE);
@@ -236,7 +248,7 @@ int main(int argc, char ** argv)
         exit(1);
     }
 
-    printf("coda del segnale creata con successo!\n");
+    printf("Coda del segnale creata con successo!\n");
 
     //---------------IMPLEMENTAZIONE CODA MSE----------------------- 
     //paramentri della coda
@@ -252,7 +264,7 @@ int main(int argc, char ** argv)
         exit(1);
     }
 
-    printf("coda dell'errore quadratico medio creata con successo!\n");
+    printf("Coda dell'errore quadratico medio creata con successo!\n");
     
     //implementazione dei thread
     pthread_t th_gen;       
@@ -314,6 +326,7 @@ int main(int argc, char ** argv)
     return 0;
 }
 
+
 double apply_filter(double input, int filter_choice) {
     switch (filter_choice) {
         case 1: // Media mobile
@@ -327,6 +340,7 @@ double apply_filter(double input, int filter_choice) {
             return get_mean_filter(input);
     }
 }
+
 
 
 double get_butter(double cur, double * a, double * b)

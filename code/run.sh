@@ -1,7 +1,7 @@
 #!/bin/bash
 
 
-FILTER_CHOICE=${1:-2}
+FILTER_CHOICE=${1:-1}
 
 # Launch the first C program
 ./store &
