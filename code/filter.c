@@ -56,116 +56,100 @@ double get_mean_filter(double cur);
 #define MAX_MSG_SIZE 256
 mqd_t queue_mse;
 
+volatile int ready = 0;
 
 //dichiarazione variabili per le risorse condivise
 double sig_noise;
-double sig_val;
-double sig_filt;
 double t=0.0;
-
 double sig_original[N_SAMPLES];
-int idx_sig_og = 0;
+int idx_sig_og = 0;                 // N.B.: ANCHE GLI INDICI VANNO INTERPRETATI COME RISORSE CONDIVISE
 double sig_filtered[N_SAMPLES];
 int idx_sig_filt = 0;
 
 pthread_mutex_t mutex_noise;    //-> protegge la risorsa condivisa sig_noise
-pthread_mutex_t mutex_val;      //-> protegge la risorsa condivisa sig_val
-pthread_mutex_t mutex_filter;   //-> protegge la risorsa condivisa sig_filt
 pthread_mutex_t mutex_time;     //-> protegge la risorsa condivisa t
-pthread_mutex_t mutex_mse;      //-> protegge le risorse condivise sig_original e sig_filtered che sono due buffer da 50 campioni
-
+pthread_mutex_t mutex_sig_original;      //-> protegge la risorsa condivisa sig_original, buffer da 50 campioni, e il suo indice idx_sig_og
+pthread_mutex_t mutex_sig_filtered;      //-> protegge la risorsa condivisa sig_filtered, buffer da 50 campioni, e il suo indice idx_sig_filt
 
 
 void* generation (void * parameter)
 {
+    ready=1; 
     //si usa la libreria pthread.h per creare generare il thread
     periodic_thread *gen = (periodic_thread *) parameter;//non necessario 'struct' perche nel file rt-lib.h è definita come typedef
     start_periodic_timer(gen, gen->period);
     // Generate signal
-    const double Ts = T_SAMPLE/1e6;         //sample time in secondi    
+    const double Ts = T_SAMPLE/1e6;         //sample time in secondi
+    printf("[GENERATION] Thread di generazione del segnale avviato (50 Hz)\n");   
 
     while(1){
         wait_next_activation(gen);
         double t_local;
         pthread_mutex_lock(&mutex_time);
-        t_local = t; /* Sampling period in s */
+        t_local = t; 
+        t += Ts; /* Sampling period in s */
         pthread_mutex_unlock(&mutex_time);
 
-        double sig_val_local = sin(2*M_PI*SIG_HZ*t_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        double sig_val = sin(2*M_PI*SIG_HZ*t_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
 
-        pthread_mutex_lock(&mutex_val);//wait sulla risorsa sig_val
-        sig_val = sig_val_local; //assegno alla risorsa condivisa ail valore della variabile locale
-        pthread_mutex_unlock(&mutex_val);//signal sulla risorsa sig_val
+        //salva il segnale originale nel buffer
+        pthread_mutex_lock(&mutex_sig_original);  //wait sul buffer
+        sig_original[idx_sig_og % N_SAMPLES] = sig_val;
+        idx_sig_og = (idx_sig_og + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_sig_original);    //signal sul buffer
 
         // Add noise to signal
-        double sig_noise_local;//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
-
-        sig_noise_local = sig_val_local + 0.5*cos(2*M_PI*10*t_local);
+        double sig_noise_local; //creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        sig_noise_local = sig_val + 0.5*cos(2*M_PI*10*t_local);
         sig_noise_local += 0.9*cos(2*M_PI*4*t_local);
         sig_noise_local += 0.9*cos(2*M_PI*12*t_local);
         sig_noise_local += 0.8*cos(2*M_PI*15*t_local);
         sig_noise_local += 0.7*cos(2*M_PI*18*t_local);
 
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
-        sig_noise = sig_noise_local;//assegno alla risorsa condivisa ail valore della variabile locale
+        sig_noise = sig_noise_local;//assegno alla risorsa condivisa il valore della variabile locale
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
-
-        //salva il segnale originale nel buffer 
-        pthread_mutex_lock(&mutex_mse);  //wait sul buffer
-        sig_original[idx_sig_og % N_SAMPLES] = sig_val_local;
-        idx_sig_og = (idx_sig_og + 1) % N_SAMPLES;
-        pthread_mutex_unlock(&mutex_mse);    //signal sul buffer
-
-        
-        pthread_mutex_lock(&mutex_time);
-        t += Ts; /* Sampling period in s */
-        pthread_mutex_unlock(&mutex_time);
-        //printf("Thread 1 in corso\n");
     }	
 }
 
 void* filtering (void * parameter)
 {
+    while(!ready) 
+        usleep(5000);
     periodic_thread *filter= (periodic_thread *) parameter;
     start_periodic_timer(filter, filter->period);
+    printf("[FILTERING] Thread di filtraggio del segnale avviato (50 Hz)\n");
 
-    // Filtering signal
+    // Filtering signalprintf("[FILTERING] Thread di filtraggio del segnale avviato (50 Hz)\n"
     while(1){
         wait_next_activation(filter);
         double sig_noise_local;//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
         pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
-        sig_noise_local = sig_noise;//assegno alla risorsa condivisa ail valore della variabile locale
+        sig_noise_local = sig_noise;//assegno alla variabile locale il valore della risorsa condivisa
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
 
-        double sig_filt_local = get_mean_filter(sig_noise_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
-        pthread_mutex_lock(&mutex_filter);//wait sulla risorsa sig_filt
-        //sig_filt = get_butter(sig_filt_local, a, b);
-	    sig_filt = sig_filt_local;//assegno alla risorsa condivisa ail valore della variabile locale
-        pthread_mutex_unlock(&mutex_filter);//signal sulla risorsa sig_filt
-
-        //salva il segnale originale nel buffer 
-        pthread_mutex_lock(&mutex_mse);  //wait sul buffer
-        sig_filtered[idx_sig_filt % N_SAMPLES] = sig_filt_local;
-        idx_sig_filt = (idx_sig_filt + 1) % N_SAMPLES;
-        pthread_mutex_unlock(&mutex_mse);    //signal sul buffer
+        double sig_filt = get_mean_filter(sig_noise_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
 
         //creazione del messaggio da mandare nella coda 
         sample_msg_t msg;
-        clock_gettime(CLOCK_REALTIME, &msg.ts);  // o CLOCK_MONOTONIC, come preferisci
+        
+        //salva il segnale originale nel buffer 
+        pthread_mutex_lock(&mutex_sig_filtered);  //wait sul buffer
+        sig_filtered[idx_sig_filt % N_SAMPLES] = sig_filt;
+        msg.filt = sig_filtered[idx_sig_filt];
+        idx_sig_filt = (idx_sig_filt + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_sig_filtered);    //signal sul buffer
  
         pthread_mutex_lock(&mutex_time);
         msg.t = t;
         pthread_mutex_unlock(&mutex_time);
-    
-        pthread_mutex_lock(&mutex_val);
-        msg.val = sig_val;
-        pthread_mutex_lock(&mutex_noise);
-        msg.noise = sig_noise;
-        pthread_mutex_lock(&mutex_filter);
-        msg.filt = sig_filt;
-        pthread_mutex_unlock(&mutex_filter);
-        pthread_mutex_unlock(&mutex_noise);
-        pthread_mutex_unlock(&mutex_val);
+
+        pthread_mutex_lock(&mutex_sig_original);
+        msg.val = sig_original[idx_sig_og];
+        pthread_mutex_unlock(&mutex_sig_original);
+        //printf("%lf\nsig_original:", msg.val);
+
+        msg.noise = sig_noise_local;
     
         //printf("Thread 2 in corso\n");
         // 4) invio UN messaggio che contiene tutti i campi
@@ -179,8 +163,11 @@ void* filtering (void * parameter)
 
 void* calculate_mse (void * parameter)
 {
+    while(!ready) 
+        usleep(5000);
     periodic_thread *mse= (periodic_thread *) parameter;
     start_periodic_timer(mse, mse->period);
+    printf("[CALCULATE] Thread di calcolo dell'mse avviato (1 Hz)\n");
 
     double local_original[N_SAMPLES];
     double local_filtered[N_SAMPLES];
@@ -188,10 +175,12 @@ void* calculate_mse (void * parameter)
     while(1)
     {
         wait_next_activation(mse);
-        pthread_mutex_lock(&mutex_mse);
+        pthread_mutex_lock(&mutex_sig_original);
         memcpy(local_original, sig_original, sizeof(sig_original));
+        pthread_mutex_unlock(&mutex_sig_original);
+        pthread_mutex_lock(&mutex_sig_filtered);
         memcpy(local_filtered, sig_filtered, sizeof(sig_filtered));
-        pthread_mutex_unlock(&mutex_mse);
+        pthread_mutex_unlock(&mutex_sig_filtered);
 
         double mse_val = 0.0;
         double diff;
@@ -200,9 +189,7 @@ void* calculate_mse (void * parameter)
             mse_val = mse_val + diff*diff;
         }
         mse_val = mse_val/N_SAMPLES;
-
-        printf("Thread 3 in corso\n");
-
+        
         //sending the message on the queue
         char msg[MAX_MSG_SIZE];
         snprintf(msg,sizeof(msg),"%f",mse_val);
@@ -224,11 +211,9 @@ int main()
     pthread_mutexattr_setprioceiling(&mymutexattr, ceiling);
 
     pthread_mutex_init(&mutex_noise, &mymutexattr);   //inizializzazione del mutex per la variabile sig_noise
-    pthread_mutex_init(&mutex_val, &mymutexattr);     //inizializzazione del mutex per la variabile sig_val
-    pthread_mutex_init(&mutex_filter, &mymutexattr);  //inizializzazione del mutex per la variabile sig_filter
     pthread_mutex_init(&mutex_time, &mymutexattr);    //inizializzazione del mutex per la variabile t
-    pthread_mutex_init(&mutex_mse, &mymutexattr);     //inizializzazione del mutex per la variabile mse
-
+    pthread_mutex_init(&mutex_sig_original, &mymutexattr);     //inizializzazione del mutex per la variabile sig_original[]
+    pthread_mutex_init(&mutex_sig_filtered, &mymutexattr);  //inizializzazione del mutex per la variabile sig_filtered[]
 
     // distruzione attributo dei mutex
     pthread_mutexattr_destroy(&mymutexattr);
@@ -267,7 +252,7 @@ int main()
     printf("coda dell'errore quadratico medio creata con successo!\n");
     
     //implementazione dei thread
-    pthread_t th_gen;       //thd1 = th_gen
+    pthread_t th_gen;       
     pthread_t th_filter;
     pthread_t th_mse;
 
@@ -358,7 +343,6 @@ double get_butter(double cur, double * a, double * b)
 double get_mean_filter(double cur)
 {
 	double retval;
-
 	static double vec_mean[2];
 	
 	// Perform sample shift
