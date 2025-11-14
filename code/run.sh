@@ -1,12 +1,15 @@
 #!/bin/bash
 
+
+FILTER_CHOICE=${1:-2}
+
 # Launch the first C program
 ./store &
 # Store its PID
 STORE_PID=$!
 
 # Launch the second C program
-./filter $1 &
+./filter $FILTER_CHOICE &
 # Store its PID
 FILTER_PID=$!
 
