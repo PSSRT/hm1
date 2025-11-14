@@ -26,9 +26,25 @@
 	""
 	
 // 2nd-order Butterw. filter, cutoff at 2Hz @ fc = 50Hz
-#define BUTTERFILT_ORD 2
 double b [3] = {0.0134,    0.0267,    0.0134};
 double a [3] = {1.0000,   -1.6475,    0.7009};
+
+// 4th-order Butterw. filter, cutoff at 2Hz @ fc = 50Hz
+double b2 [5] = {0.0004166, 0.0016664, 0.0024996, 0.0016664, 0.0004166};
+double a2 [5] = {1.0, -3.1806, 3.8612, -2.1122, 0.4383};
+
+
+// Variabili per il filtro di Kalman
+typedef struct {
+    double x;      // stima corrente del segnale
+    double P;      // errore di stima
+    double Q;      // varianza del processo (piccola)
+    double R;      // varianza del rumore di misura (più grande)
+} KalmanFilter;
+
+static KalmanFilter kf;
+static int init = 0;
+
 
 //Variabili per la coda
 #define MQ_NAME "/print_q" //nome della coda
@@ -47,10 +63,12 @@ mqd_t queue_sig;
 static int first_mean=0;
 int filter_choice = 1; // default filtro media mobile
 
-
-double get_butter(double cur, double * a, double * b);
+// prototipi
+double get_butter(int order, double cur, double * a, double * b);
 double get_mean_filter(double cur);
 double apply_filter(double input, int choice);
+void kalman_init(KalmanFilter *kf, double init_val, double process_var, double meas_var);
+double get_kalman(KalmanFilter *kf, double meas);
 
 //Variabili per il calcolo di mse
 #define MSE_QUEUE_NAME "/mse_q"
@@ -215,6 +233,10 @@ int main(int argc, char ** argv)
     }
     if(filter_choice == 2)
         printf("Filtro selezionato: Filtro di Butterworth del 2° ordine\n");
+    else if(filter_choice == 3)
+        printf("Filtro selezionato: Filtro di Butterworth del 4° ordine\n");
+    else if(filter_choice == 4)
+        printf("Filtro selezionato: Filtro di Kalman\n");
     else
         printf("Filtro selezionato: Filtro a media mobile\n");
 
@@ -332,43 +354,49 @@ double apply_filter(double input, int filter_choice) {
         case 1: // Media mobile
             return get_mean_filter(input);
         case 2: // Butterworth 2° ordine
-            return get_butter(input, a, b);
-        //case 3: // Filtro opzionale (esempio: passa alto)
-            // return get_highpass(input);
-            //return input; // placeholder
+            return get_butter(2, input, a, b);
+        case 3: // Butterworth 4° ordine
+            return get_butter(4, input, a2, b2);
+        case 4: // Filtro di Kalman
+            if(!init){
+                kalman_init(&kf, input, 0.0001, 0.5); // Inizializzazione del filtro di Kalmann
+                init = 1;}
+            return get_kalman(&kf, input);
         default:
             return get_mean_filter(input);
     }
 }
 
 
-
-double get_butter(double cur, double * a, double * b)
+double get_butter(int order, double cur, double *a, double *b)
 {
-	double retval;
-	int i;
+    double retval = 0;
 
-	static double in[BUTTERFILT_ORD+1];
-	static double out[BUTTERFILT_ORD+1];
-	
-	// Perform sample shift
-	for (i = BUTTERFILT_ORD; i > 0; --i) {
-		in[i] = in[i-1];
-		out[i] = out[i-1];
-	}
-	in[0] = cur;
+    // Static buffer per input/output massimo 4° ordine
+    static double in[5] = {0};   // max ordine = 4 → 4+1 = 5
+    static double out[5] = {0};
 
-	// Compute filtered value
-	retval = 0;
-	for (i = 0; i < BUTTERFILT_ORD+1; ++i) {
-		retval += in[i] * b[i];
-		if (i > 0)
-			retval -= out[i] * a[i];
-	}
-	out[0] = retval;
+    int i;
 
-	return retval;
+    // Shift dei campioni
+    for(i = order; i > 0; i--) {
+        in[i] = in[i-1];
+        out[i] = out[i-1];
+    }
+    in[0] = cur;
+
+    // Calcolo filtro
+    for(i = 0; i <= order; i++) {
+        retval += in[i] * b[i];
+        if(i > 0)
+            retval -= out[i] * a[i];
+    }
+
+    out[0] = retval;
+
+    return retval;
 }
+
 
 double get_mean_filter(double cur)
 {
@@ -389,3 +417,27 @@ double get_mean_filter(double cur)
 	}
 	return retval;
 }
+
+// Inizializzazione del filtro di Kalman
+void kalman_init(KalmanFilter *kf, double init_val, double process_var, double meas_var)
+{
+    kf->x = init_val;     // inizializzazione segnale stimato
+    kf->P = 1.0;          // errore iniziale
+    kf->Q = process_var;  // piccola
+    kf->R = meas_var;     // dipende dall’ampiezza del rumore
+}  
+
+// Aggiornamento del filtro di Kalman
+double get_kalman(KalmanFilter *kf, double meas) {
+    // Predizione
+    double x_pred = kf->x;   // modello: x_k+1 = x_k
+    double P_pred = kf->P + kf->Q;
+
+    // Aggiornamento
+    double K = P_pred / (P_pred + kf->R);  // guadagno di Kalman
+    kf->x = x_pred + K * (meas - x_pred);
+    kf->P = (1 - K) * P_pred;
+
+    return kf->x;  // segnale stimato filtrato
+}
+
