@@ -60,7 +60,7 @@ volatile int ready = 0;
 const double Ts = T_SAMPLE/1e6;         //sample time in secondi
 
 //dichiarazione variabili per le risorse condivise
-double sig_noise;
+double sig_noise;        
 double t=0.0;
 double sig_original[N_SAMPLES];
 int idx_sig_og = 0;                 // N.B.: ANCHE GLI INDICI VANNO INTERPRETATI COME RISORSE CONDIVISE
@@ -129,6 +129,7 @@ void* filtering (void * parameter)
         pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
 
         double sig_filt = get_mean_filter(sig_noise_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        //double sig_filt = get_butter(sig_noise_local,a,b);
 
         //creazione del messaggio da mandare nella coda 
         sample_msg_t msg;
@@ -145,7 +146,7 @@ void* filtering (void * parameter)
         pthread_mutex_unlock(&mutex_time);
 
         pthread_mutex_lock(&mutex_sig_original);
-        msg.val = sig_original[idx_sig_og-1];
+        msg.val = sig_original[(idx_sig_og + N_SAMPLES - 1) % N_SAMPLES];
         pthread_mutex_unlock(&mutex_sig_original);
         //printf("%lf\nsig_original:", msg.val);
 
