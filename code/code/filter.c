@@ -1,0 +1,443 @@
+#include <pthread.h>  //inserimento della libreria pthread per la creazione di thread periodici
+#include <stdio.h>
+#include <stdlib.h>
+#include <signal.h>
+#include <string.h>
+#include <unistd.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <math.h>
+#include "rt-lib.h"
+#include <errno.h> //per il controllo degli errorri
+#include <mqueue.h> //inclusione della libreria per la creazione e gestione di code per la comunicazione tar filter.c e store.c
+
+#define SIG_SAMPLE SIGRTMIN
+#define N_SAMPLES 50
+#define SIG_HZ 1.0
+#define T_SAMPLE 20000      //50 Hz
+
+#define USAGE_STR				\
+	"Usage: %s [-s] [-n] [-f]\n"		\
+	"\t -s: plot original signal\n"		\
+	"\t -n: plot noisy signal\n"		\
+	"\t -f: plot filtered signal\n"		\
+	""
+	
+// 2nd-order Butterw. filter, cutoff at 2Hz @ fc = 50Hz
+double b [3] = {0.0134,    0.0267,    0.0134};
+double a [3] = {1.0000,   -1.6475,    0.7009};
+
+// 4th-order Butterw. filter, cutoff at 2Hz @ fc = 50Hz
+double b2 [5] = {0.0004166, 0.0016664, 0.0024996, 0.0016664, 0.0004166};
+double a2 [5] = {1.0, -3.1806, 3.8612, -2.1122, 0.4383};
+
+
+// Variabili per il filtro di Kalman
+typedef struct {
+    double x;      // stima corrente del segnale
+    double P;      // errore di stima
+    double Q;      // varianza del processo (piccola)
+    double R;      // varianza del rumore di misura (più grande)
+} KalmanFilter;
+
+static KalmanFilter kf;
+static int init = 0;
+
+
+//Variabili per la coda
+#define MQ_NAME "/print_q" //nome della coda
+#define MAX_MSG 10 //massimo numero di messaggi 
+
+typedef struct{
+    struct timespec ts;
+    double t;
+    double val;
+    double noise;
+    double filt;
+}sample_msg_t;
+
+mqd_t queue_sig;
+
+static int first_mean=0;
+int filter_choice = 1; // default filtro media mobile
+
+// prototipi
+double get_butter(int order, double cur, double * a, double * b);
+double get_mean_filter(double cur);
+double apply_filter(double input, int choice);
+void kalman_init(KalmanFilter *kf, double init_val, double process_var, double meas_var);
+double get_kalman(KalmanFilter *kf, double meas);
+
+//Variabili per il calcolo di mse
+#define MSE_QUEUE_NAME "/mse_q"
+#define T_SAMPLE_MSE 1000000      //1 Hz
+#define MAX_MSG_MSE 50 //massimo numero di messaggi
+#define MAX_MSG_SIZE 256
+mqd_t queue_mse;
+
+volatile int ready = 0;
+const double Ts = T_SAMPLE/1e6;         //sample time in secondi
+
+//dichiarazione variabili per le risorse condivise
+double sig_noise;        
+double t=0.0;
+double sig_original[N_SAMPLES];
+int idx_sig_og = 0;                 // N.B.: ANCHE GLI INDICI VANNO INTERPRETATI COME RISORSE CONDIVISE
+double sig_filtered[N_SAMPLES];
+int idx_sig_filt = 0;
+
+pthread_mutex_t mutex_noise;    //-> protegge la risorsa condivisa sig_noise
+pthread_mutex_t mutex_time;     //-> protegge la risorsa condivisa t
+pthread_mutex_t mutex_sig_original;      //-> protegge la risorsa condivisa sig_original, buffer da 50 campioni, e il suo indice idx_sig_og
+pthread_mutex_t mutex_sig_filtered;      //-> protegge la risorsa condivisa sig_filtered, buffer da 50 campioni, e il suo indice idx_sig_filt
+
+
+void* generation (void * parameter)
+{
+    ready=1; 
+    //si usa la libreria pthread.h per creare generare il thread
+    periodic_thread *gen = (periodic_thread *) parameter;//non necessario 'struct' perche nel file rt-lib.h è definita come typedef
+    start_periodic_timer(gen, gen->period);
+    // Generate signal
+    printf("[GENERATION] Thread di generazione del segnale avviato (50 Hz)\n");   
+
+    while(1){
+        wait_next_activation(gen);
+        double t_local;
+        pthread_mutex_lock(&mutex_time);
+        t_local = t; 
+        t += Ts; /* Sampling period in s */
+        pthread_mutex_unlock(&mutex_time);
+
+        double sig_val = sin(2*M_PI*SIG_HZ*t_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+
+        //salva il segnale originale nel buffer
+        pthread_mutex_lock(&mutex_sig_original);  //wait sul buffer
+        sig_original[idx_sig_og % N_SAMPLES] = sig_val;
+        idx_sig_og = (idx_sig_og + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_sig_original);    //signal sul buffer
+
+        // Add noise to signal
+        double sig_noise_local; //creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        sig_noise_local = sig_val + 0.5*cos(2*M_PI*10*t_local);
+        sig_noise_local += 0.9*cos(2*M_PI*4*t_local);
+        sig_noise_local += 0.9*cos(2*M_PI*12*t_local);
+        sig_noise_local += 0.8*cos(2*M_PI*15*t_local);
+        sig_noise_local += 0.7*cos(2*M_PI*18*t_local);
+
+        pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
+        sig_noise = sig_noise_local;//assegno alla risorsa condivisa il valore della variabile locale
+        pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
+    }	
+}
+
+void* filtering (void * parameter)
+{
+    while(!ready) 
+        usleep(5000);
+    periodic_thread *filter= (periodic_thread *) parameter;
+    start_periodic_timer(filter, filter->period);
+    printf("[FILTERING] Thread di filtraggio del segnale avviato (50 Hz)\n");
+
+    // Filtering signalprintf("[FILTERING] Thread di filtraggio del segnale avviato (50 Hz)\n"
+    while(1){
+        wait_next_activation(filter);
+        double sig_noise_local;//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        pthread_mutex_lock(&mutex_noise);//wait sulla risorsa sig_noise
+        sig_noise_local = sig_noise;//assegno alla variabile locale il valore della risorsa condivisa
+        pthread_mutex_unlock(&mutex_noise); //signal sulla risorsa sig_noise
+
+        //double sig_filt = get_mean_filter(sig_noise_local);//creo variabile local in modo tale che il lock resti tenuto per il minimo indispensabile
+        //double sig_filt = get_butter(sig_noise_local,a,b);
+
+        // Applicazione di uno dei filtri definiti
+        double sig_filt = apply_filter(sig_noise_local,filter_choice);
+
+        //creazione del messaggio da mandare nella coda 
+        sample_msg_t msg;
+        
+        //salva il segnale originale nel buffer 
+        pthread_mutex_lock(&mutex_sig_filtered);  //wait sul buffer
+        sig_filtered[idx_sig_filt % N_SAMPLES] = sig_filt;
+        msg.filt = sig_filtered[idx_sig_filt];
+        idx_sig_filt = (idx_sig_filt + 1) % N_SAMPLES;
+        pthread_mutex_unlock(&mutex_sig_filtered);    //signal sul buffer
+ 
+        pthread_mutex_lock(&mutex_time);
+        msg.t = t-Ts;
+        pthread_mutex_unlock(&mutex_time);
+
+        pthread_mutex_lock(&mutex_sig_original);
+        msg.val = sig_original[(idx_sig_og + N_SAMPLES - 1) % N_SAMPLES];
+        pthread_mutex_unlock(&mutex_sig_original);
+        //printf("%lf\nsig_original:", msg.val);
+
+        msg.noise = sig_noise_local;
+    
+        //printf("Thread 2 in corso\n");
+        // 4) invio UN messaggio che contiene tutti i campi
+        if (mq_send(queue_sig, (const char*)&msg, sizeof(msg), 0) == -1) {
+            perror("mq_send"); // se apri O_NONBLOCK e la coda è piena -> errno == EAGAIN
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+
+void* calculate_mse (void * parameter)
+{
+    while(!ready) 
+        usleep(5000);
+    periodic_thread *mse= (periodic_thread *) parameter;
+    start_periodic_timer(mse, mse->period);
+    printf("[CALCULATE] Thread di calcolo dell'mse avviato (1 Hz)\n");
+
+    double local_original[N_SAMPLES];
+    double local_filtered[N_SAMPLES];
+
+    while(1)
+    {
+        wait_next_activation(mse);
+        pthread_mutex_lock(&mutex_sig_original);
+        memcpy(local_original, sig_original, sizeof(sig_original));
+        pthread_mutex_unlock(&mutex_sig_original);
+        pthread_mutex_lock(&mutex_sig_filtered);
+        memcpy(local_filtered, sig_filtered, sizeof(sig_filtered));
+        pthread_mutex_unlock(&mutex_sig_filtered);
+
+        double mse_val = 0.0;
+        double diff;
+        for (int i=0; i<N_SAMPLES; i++){
+            diff = local_original[i] - local_filtered[i];
+            mse_val = mse_val + diff*diff;
+        }
+        mse_val = mse_val/N_SAMPLES;
+        
+        //sending the message on the queue
+        char msg[MAX_MSG_SIZE];
+        snprintf(msg,sizeof(msg),"%f",mse_val);
+        //printf("\n[FILTER] MSE:%s", msg);
+        if(mq_send(queue_mse,msg,strlen(msg)+1,0) == -1){
+            perror("calculate_mse:mq_send");
+            exit(EXIT_FAILURE);
+        }
+    }
+}
+
+int main(int argc, char ** argv)
+{
+    if (argc > 1) {
+        filter_choice = atoi(argv[1]); // converte l'argomento in numero
+    }
+    if(filter_choice == 2)
+        printf("Filtro selezionato: Filtro di Butterworth del 2° ordine\n");
+    else if(filter_choice == 3)
+        printf("Filtro selezionato: Filtro di Butterworth del 4° ordine\n");
+    else if(filter_choice == 4)
+        printf("Filtro selezionato: Filtro di Kalman\n");
+    else
+        printf("Filtro selezionato: Filtro a media mobile\n");
+
+    //implementazione dei mutex, si usa come protocollo il Priority ceiling
+    int ceiling = 80; // si setta il ceiling al massimo delle priorità tra tutti i thread che possono prendere quel mutex
+    pthread_mutexattr_t mymutexattr; //attributo generale per una variabile mutex 
+    pthread_mutexattr_init(&mymutexattr); //inizializazzione della variabile
+    pthread_mutexattr_setprotocol(&mymutexattr, PTHREAD_PRIO_PROTECT);
+    pthread_mutexattr_setprioceiling(&mymutexattr, ceiling);
+
+    pthread_mutex_init(&mutex_noise, &mymutexattr);   //inizializzazione del mutex per la variabile sig_noise
+    pthread_mutex_init(&mutex_time, &mymutexattr);    //inizializzazione del mutex per la variabile t
+    pthread_mutex_init(&mutex_sig_original, &mymutexattr);     //inizializzazione del mutex per la variabile sig_original[]
+    pthread_mutex_init(&mutex_sig_filtered, &mymutexattr);  //inizializzazione del mutex per la variabile sig_filtered[]
+
+    // distruzione attributo dei mutex
+    pthread_mutexattr_destroy(&mymutexattr);
+
+    
+    //---------------IMPLEMENTAZIONE CODA SEGNALI----------------------- 
+    //paramentri della coda
+    struct mq_attr attr_queue;
+    attr_queue.mq_flags = 0;
+    attr_queue.mq_maxmsg = MAX_MSG;
+    attr_queue.mq_msgsize = sizeof(sample_msg_t);   //48 byte
+    attr_queue.mq_curmsgs = 0;
+
+
+    if((queue_sig = mq_open(MQ_NAME, O_CREAT | O_WRONLY , 0644, &attr_queue)) == -1){//accesso alla coda in sola scrittura (apertura non bloccante)
+        perror("Errore nella creazione e apertura della coda del segnale \n");
+        exit(1);
+    }
+
+    printf("Coda del segnale creata con successo!\n");
+
+    //---------------IMPLEMENTAZIONE CODA MSE----------------------- 
+    //paramentri della coda
+    struct mq_attr attr_queue_mse;
+    attr_queue_mse.mq_flags = 0;
+    attr_queue_mse.mq_maxmsg = MAX_MSG_MSE;
+    attr_queue_mse.mq_msgsize = MAX_MSG_SIZE;      //256 byte
+    attr_queue_mse.mq_curmsgs = 0;
+
+
+    if((queue_mse = mq_open(MSE_QUEUE_NAME, O_CREAT | O_WRONLY , 0660, &attr_queue_mse)) == -1){//accesso alla coda in sola scrittura (apertura non bloccante)
+        perror("Errore nella creazione e apertura della coda dell'errore quadratico medio\n");
+        exit(1);
+    }
+
+    printf("Coda dell'errore quadratico medio creata con successo!\n");
+    
+    //implementazione dei thread
+    pthread_t th_gen;       
+    pthread_t th_filter;
+    pthread_t th_mse;
+
+    periodic_thread * TH_gen = malloc(sizeof(periodic_thread));
+    periodic_thread * TH_filter = malloc(sizeof(periodic_thread));    
+    periodic_thread * TH_mse = malloc(sizeof(periodic_thread));
+
+    //IMPLEMENTAZIONE THREAD
+    pthread_attr_t attr;
+    struct sched_param par;
+
+    pthread_attr_init(&attr);
+    pthread_attr_setschedpolicy(&attr,SCHED_FIFO);
+    pthread_attr_setinheritsched(&attr,PTHREAD_EXPLICIT_SCHED);
+
+    //THREAD GENERAZIONE SEGNALE
+    TH_gen->index = 1;
+    TH_gen->period = T_SAMPLE;
+    TH_gen->priority = 80;
+    par.sched_priority= TH_gen->priority;
+    pthread_attr_setschedparam(&attr,&par);
+    pthread_create(&th_gen, &attr, generation, TH_gen);
+
+
+    //THREAD FILTRAGGIO SEGNALE
+    TH_filter->index = 2;
+    TH_filter->period = T_SAMPLE;
+    TH_filter->priority = 80;
+    par.sched_priority= TH_filter->priority;
+    pthread_attr_setschedparam(&attr,&par);
+    pthread_create(&th_filter, &attr, filtering, TH_filter);
+
+    
+    //THREAD CALCOLO MSE
+    TH_mse->index = 2;
+    TH_mse->period = T_SAMPLE_MSE;
+    TH_mse->priority = 60;
+    par.sched_priority= TH_mse->priority;
+    pthread_attr_setschedparam(&attr,&par);
+    pthread_create(&th_mse, &attr, calculate_mse, TH_mse);
+    
+    //distruzione attributo dei thread 
+    pthread_attr_destroy(&attr);
+    while(1) {
+        if(getchar()=='q'){
+            printf("Processo terminato con sucesso!\n");
+            break;
+        }
+    }
+
+    mq_close(queue_sig);
+    mq_unlink(MQ_NAME);
+
+    mq_close(queue_mse);
+    mq_unlink(MSE_QUEUE_NAME);
+    return 0;
+}
+
+
+double apply_filter(double input, int filter_choice) {
+    switch (filter_choice) {
+        case 1: // Media mobile
+            return get_mean_filter(input);
+        case 2: // Butterworth 2° ordine
+            return get_butter(2, input, a, b);
+        case 3: // Butterworth 4° ordine
+            return get_butter(4, input, a2, b2);
+        case 4: // Filtro di Kalman
+            if(!init){
+                kalman_init(&kf, input, 0.001, 0.05); // Inizializzazione del filtro di Kalmann
+                init = 1;}
+            return get_kalman(&kf, input);
+        default:
+            return get_mean_filter(input);
+    }
+}
+
+
+double get_butter(int order, double cur, double *a, double *b)
+{
+    double retval = 0;
+
+    // Static buffer per input/output massimo 4° ordine
+    static double in[5] = {0};   // max ordine = 4 → 4+1 = 5
+    static double out[5] = {0};
+
+    int i;
+
+    // Shift dei campioni
+    for(i = order; i > 0; i--) {
+        in[i] = in[i-1];
+        out[i] = out[i-1];
+    }
+    in[0] = cur;
+
+    // Calcolo filtro
+    for(i = 0; i <= order; i++) {
+        retval += in[i] * b[i];
+        if(i > 0)
+            retval -= out[i] * a[i];
+    }
+
+    out[0] = retval;
+
+    return retval;
+}
+
+
+double get_mean_filter(double cur)
+{
+	double retval;
+	static double vec_mean[2];
+	
+	// Perform sample shift
+	vec_mean[1] = vec_mean[0];
+	vec_mean[0] = cur;
+
+	//printf("in[0]: %f, in[1]: %f\n", in[0], in[1]); //DEBUG
+	if (first_mean == 0){
+		retval = vec_mean[0];
+		first_mean ++;
+	}
+	else{
+		retval = (vec_mean[0] + vec_mean[1])/2;	
+	}
+	return retval;
+}
+
+// Inizializzazione del filtro di Kalman
+void kalman_init(KalmanFilter *kf, double init_val, double process_var, double meas_var)
+{
+    kf->x = init_val;     // inizializzazione segnale stimato
+    kf->P = 1.0;          // errore iniziale
+    kf->Q = process_var;  // piccola
+    kf->R = meas_var;     // dipende dall’ampiezza del rumore
+}  
+
+// Aggiornamento del filtro di Kalman
+double get_kalman(KalmanFilter *kf, double meas) {
+    // Predizione
+    double x_pred = kf->x;   // modello: x_k+1 = x_k
+    double P_pred = kf->P + kf->Q;
+
+    // Aggiornamento
+    double K = P_pred / (P_pred + kf->R);  // guadagno di Kalman
+    kf->x = x_pred + K * (meas - x_pred);
+    kf->P = (1 - K) * P_pred;
+
+    return kf->x;  // segnale stimato filtrato
+}
+
